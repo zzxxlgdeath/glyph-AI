@@ -65,6 +65,9 @@ fun HistoryScreen(
 ) {
     var showClearAllConfirmDialog by remember { mutableStateOf(false) }
     var itemToDelete by remember { mutableStateOf<OracleHistoryItem?>(null) }
+    val dateFormatter = remember {
+        SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
+    }
 
     if (showClearAllConfirmDialog) {
         NothingConfirmationDialog(
@@ -219,8 +222,12 @@ fun HistoryScreen(
                     contentPadding = PaddingValues(bottom = 24.dp)
                 ) {
                     items(history, key = { it.id }) { item ->
+                        val formattedDate = remember(item.timestamp) {
+                            dateFormatter.format(Date(item.timestamp))
+                        }
                         HistoryItemCard(
                             item = item,
+                            formattedDate = formattedDate,
                             isEnglish = isEnglish,
                             onReplay = { onReplayOnMatrix(item) },
                             onDelete = { itemToDelete = item }
@@ -235,13 +242,11 @@ fun HistoryScreen(
 @Composable
 private fun HistoryItemCard(
     item: OracleHistoryItem,
+    formattedDate: String,
     isEnglish: Boolean,
     onReplay: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val formattedDate = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
-        .format(Date(item.timestamp))
-
     Card(
         modifier = Modifier
             .fillMaxWidth()

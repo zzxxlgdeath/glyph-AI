@@ -24,12 +24,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -52,22 +54,28 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.data.AiProvider
 import com.example.data.OracleSettings
 import com.example.data.POPULAR_OPENAI_COMPATIBLE_ENDPOINTS
+import com.example.data.SttProvider
 import com.example.data.VoiceCaptureMode
 import com.example.ui.theme.NothingAmber
 import com.example.ui.theme.NothingBorder
@@ -101,12 +109,17 @@ fun AiSettingsScreen(
     onUpdateBrightness: (Int) -> Unit,
     onUpdateScrollSpeed: (Int) -> Unit,
     onUpdateSilenceTimeout: (Int) -> Unit,
+    onUpdateUiLanguage: (String) -> Unit = {},
     onUpdateSpeechLanguage: (String) -> Unit,
+    onUpdateSttProvider: (SttProvider) -> Unit = {},
     onUpdateVoiceCaptureMode: (VoiceCaptureMode) -> Unit,
+    onUpdateBackgroundServiceEnabled: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var showApiKey by rememberSaveable { mutableStateOf(false) }
     var newCustomModelText by rememberSaveable { mutableStateOf("") }
+    var modelSearchQuery by rememberSaveable { mutableStateOf("") }
+    var showAllModels by rememberSaveable { mutableStateOf(false) }
 
     var showResetPromptConfirm by rememberSaveable { mutableStateOf(false) }
     var showClearKeysConfirm by rememberSaveable { mutableStateOf(false) }
@@ -119,17 +132,29 @@ fun AiSettingsScreen(
     val hasActiveKey = resolvedKey.isNotBlank()
     val rawModelInput = settings.getRawModelInput(activeProvider)
     val customModelsForProvider = settings.getCustomModelsForProvider(activeProvider)
+    val fetchedModelsForProvider = settings.getFetchedModelsForProvider(activeProvider)
     val allAvailableModels = settings.getAllModelsForProvider(activeProvider)
     val hasAnySavedKey = AiProvider.entries.any { settings.getResolvedApiKey(it).isNotBlank() }
 
-    // Confirmation Dialog: Reset System Prompt
+    val filteredModels = remember(allAvailableModels, modelSearchQuery) {
+        val q = modelSearchQuery.trim()
+        if (q.isEmpty()) {
+            allAvailableModels
+        } else {
+            allAvailableModels.filter { it.contains(q, ignoreCase = true) }
+        }
+    }
+    val displayedModels = remember(filteredModels, showAllModels) {
+        if (showAllModels || filteredModels.size <= 24) filteredModels else filteredModels.take(24)
+    }
+
     if (showResetPromptConfirm) {
         NothingConfirmationDialog(
             title = if (isEn) "RESET SYSTEM PROMPT?" else "СБРОСИТЬ ПРОМПТ?",
             message = if (isEn) {
-                "Restore the default concise system instruction and set word limit back to 2?"
+                "Restore the default concise system instruction for the AI?"
             } else {
-                "Восстановить стандартный краткий системный промпт и вернуть лимит в 2 слова?"
+                "Восстановить стандартный системный промпт по умолчанию?"
             },
             confirmLabel = if (isEn) "RESET" else "СБРОСИТЬ",
             cancelLabel = if (isEn) "CANCEL" else "ОТМЕНА",
@@ -141,7 +166,6 @@ fun AiSettingsScreen(
         )
     }
 
-    // Confirmation Dialog: Clear All API Keys
     if (showClearKeysConfirm) {
         NothingConfirmationDialog(
             title = if (isEn) "CLEAR ALL API KEYS?" else "УДАЛИТЬ ВСЕ КЛЮЧИ?",
@@ -160,7 +184,6 @@ fun AiSettingsScreen(
         )
     }
 
-    // Confirmation Dialog: Remove Custom Model
     val modelToDelete = pendingModelToRemove
     if (modelToDelete != null) {
         NothingConfirmationDialog(
@@ -208,9 +231,9 @@ fun AiSettingsScreen(
                         .padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    // 1. Language Selector at the VERY TOP of Settings (2 options: Русский / English)
+                    // 1. UI Language Selector
                     Text(
-                        text = if (isEn) "Interface & Voice Language" else "Язык интерфейса и голоса",
+                        text = if (isEn) "Interface Language" else "Язык интерфейса",
                         style = MaterialTheme.typography.titleMedium,
                         color = NothingWhite,
                         maxLines = 1,
@@ -225,15 +248,53 @@ fun AiSettingsScreen(
                         LanguageOptionChip(
                             label = "Русский",
                             isSelected = !isEn,
-                            onClick = { onUpdateSpeechLanguage("ru-RU") },
+                            onClick = { onUpdateUiLanguage("ru") },
                             testTag = "lang_chip_ru-RU",
                             modifier = Modifier.weight(1f)
                         )
                         LanguageOptionChip(
                             label = "English",
                             isSelected = isEn,
-                            onClick = { onUpdateSpeechLanguage("en-US") },
+                            onClick = { onUpdateUiLanguage("en") },
                             testTag = "lang_chip_en-US",
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    // Speech Recognition Language (Auto / RU / EN)
+                    Text(
+                        text = if (isEn) "Voice Recognition Language" else "Язык распознавания речи",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = NothingWhite,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val speechLang = settings.speechLanguage
+                        LanguageOptionChip(
+                            label = if (isEn) "Auto" else "Авто",
+                            isSelected = speechLang.equals("auto", ignoreCase = true),
+                            onClick = { onUpdateSpeechLanguage("auto") },
+                            testTag = "speech_lang_auto",
+                            modifier = Modifier.weight(1f)
+                        )
+                        LanguageOptionChip(
+                            label = "RU",
+                            isSelected = speechLang.startsWith("ru", ignoreCase = true),
+                            onClick = { onUpdateSpeechLanguage("ru-RU") },
+                            testTag = "speech_lang_ru",
+                            modifier = Modifier.weight(1f)
+                        )
+                        LanguageOptionChip(
+                            label = "EN",
+                            isSelected = speechLang.startsWith("en", ignoreCase = true),
+                            onClick = { onUpdateSpeechLanguage("en-US") },
+                            testTag = "speech_lang_en",
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -307,7 +368,7 @@ fun AiSettingsScreen(
                         }
                     }
 
-                    // 3. API Key Input (ALWAYS FIRST for all 6 providers)
+                    // 3. API Key Input
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -346,8 +407,8 @@ fun AiSettingsScreen(
                                 )
                                 Text(
                                     text = when {
-                                        hasActiveKey && isEn -> "Key set"
-                                        hasActiveKey -> "Ключ указан"
+                                        hasActiveKey && isEn -> "Encrypted (Keystore)"
+                                        hasActiveKey -> "Зашифрован (Keystore)"
                                         isEn -> "No key"
                                         else -> "Нет ключа"
                                     },
@@ -403,7 +464,7 @@ fun AiSettingsScreen(
                         )
                     }
 
-                    // 4. Custom Base URL field AFTER API Key when CUSTOM_OPENAI is selected
+                    // 4. Custom Base URL field when CUSTOM_OPENAI is selected
                     if (activeProvider == AiProvider.CUSTOM_OPENAI) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(
@@ -572,12 +633,12 @@ fun AiSettingsScreen(
                         }
                     }
 
-                    // 6. Action Buttons: Fetch Models from API & Test API (both 48.dp height, gated by hasActiveKey)
+                    // 6. Action Buttons: Refresh Models from API & Test API
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        val canFetch = hasActiveKey && !isFetchingModels
+                        val canFetch = (hasActiveKey || activeProvider == AiProvider.OPENROUTER) && !isFetchingModels
                         OutlinedButton(
                             onClick = onFetchModelsFromApi,
                             enabled = canFetch,
@@ -585,25 +646,28 @@ fun AiSettingsScreen(
                                 .weight(1f)
                                 .height(48.dp)
                                 .testTag("fetch_models_button"),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                             shape = RoundedCornerShape(14.dp),
                             border = BorderStroke(1.dp, NothingBorder)
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.CloudDownload,
-                                contentDescription = "Fetch models",
+                                contentDescription = "Refresh models",
                                 tint = if (canFetch) NothingWhite else NothingGray,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(15.dp)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
                                 text = when {
-                                    isFetchingModels && isEn -> "LOADING..."
-                                    isFetchingModels -> "ЗАГРУЗКА..."
-                                    isEn -> "FETCH MODELS"
-                                    else -> "МОДЕЛИ ИЗ API"
+                                    isFetchingModels && isEn -> "SYNCING..."
+                                    isFetchingModels -> "ОБНОВЛЕНИЕ..."
+                                    isEn -> "REFRESH MODELS"
+                                    else -> "ОБНОВИТЬ МОДЕЛИ"
                                 },
-                                style = MaterialTheme.typography.labelLarge,
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontSize = 11.sp,
+                                    letterSpacing = 0.2.sp
+                                ),
                                 color = if (canFetch) NothingWhite else NothingGray,
                                 maxLines = 1,
                                 softWrap = false,
@@ -618,7 +682,7 @@ fun AiSettingsScreen(
                                 .weight(1f)
                                 .height(48.dp)
                                 .testTag("test_api_button"),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                             shape = RoundedCornerShape(14.dp),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = NothingRed,
@@ -630,12 +694,15 @@ fun AiSettingsScreen(
                             Icon(
                                 imageVector = Icons.Filled.NetworkCheck,
                                 contentDescription = "Test API",
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(15.dp)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
                                 text = if (isEn) "TEST API" else "ТЕСТ API",
-                                style = MaterialTheme.typography.labelLarge,
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontSize = 11.sp,
+                                    letterSpacing = 0.2.sp
+                                ),
                                 maxLines = 1,
                                 softWrap = false,
                                 overflow = TextOverflow.Ellipsis
@@ -646,9 +713,9 @@ fun AiSettingsScreen(
                     if (!hasActiveKey) {
                         Text(
                             text = if (isEn) {
-                                "Preset models below can be selected right away; enter an API key above to load server models or test the API."
+                                "Enter an API key above — the model list will automatically sync with the server."
                             } else {
-                                "Предустановленные модели ниже можно выбрать сразу; введите API-ключ выше для подгрузки моделей с сервера и теста API."
+                                "После ввода API-ключа список актуальных моделей подгрузится с сервера автоматически."
                             },
                             style = MaterialTheme.typography.bodyMedium,
                             color = NothingGray
@@ -677,24 +744,46 @@ fun AiSettingsScreen(
                         }
                     }
 
-                    // 7. Models Chips & Clear Saved Keys
+                    // 7. Models Chips, Search Filter & Clear Saved Keys
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = if (isEn) "Available Models" else "Доступные модели",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = NothingWhite,
-                                maxLines = 1,
-                                softWrap = false,
-                                overflow = TextOverflow.Ellipsis,
+                            Column(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .padding(end = 8.dp)
-                            )
+                                    .padding(end = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = if (isEn) "Available Models" else "Доступные модели",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = NothingWhite,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                val syncSubtitle = when {
+                                    isFetchingModels && isEn -> "Auto-updating from API..."
+                                    isFetchingModels -> "Автоподгрузка актуального списка из API..."
+                                    fetchedModelsForProvider.isNotEmpty() && isEn ->
+                                        "Live from API • ${fetchedModelsForProvider.size} models"
+                                    fetchedModelsForProvider.isNotEmpty() ->
+                                        "Актуальные из API • ${fetchedModelsForProvider.size} шт."
+                                    isEn -> "Presets • ${allAvailableModels.size} models"
+                                    else -> "Пресеты • ${allAvailableModels.size} шт."
+                                }
+                                Text(
+                                    text = syncSubtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (fetchedModelsForProvider.isNotEmpty()) NothingGreen else NothingGray,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
 
                             if (hasAnySavedKey) {
                                 OutlinedButton(
@@ -722,14 +811,59 @@ fun AiSettingsScreen(
                             }
                         }
 
+                        if (allAvailableModels.size > 8) {
+                            OutlinedTextField(
+                                value = modelSearchQuery,
+                                onValueChange = { modelSearchQuery = it },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .testTag("model_search_input"),
+                                singleLine = true,
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Filled.Search,
+                                        contentDescription = null,
+                                        tint = NothingGray,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                },
+                                trailingIcon = if (modelSearchQuery.isNotEmpty()) {
+                                    {
+                                        IconButton(onClick = { modelSearchQuery = "" }) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Clear,
+                                                contentDescription = if (isEn) "Clear search" else "Очистить поиск",
+                                                tint = NothingGray,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                } else null,
+                                placeholder = {
+                                    Text(
+                                        text = if (isEn) "Filter models..." else "Поиск по списку моделей...",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = NothingGray
+                                    )
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = NothingWhite,
+                                    unfocusedBorderColor = NothingBorder,
+                                    focusedContainerColor = NothingCardElevated,
+                                    unfocusedContainerColor = NothingCardElevated
+                                )
+                            )
+                        }
+
                         FlowRow(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            allAvailableModels.forEach { modelItem ->
+                            displayedModels.forEach { modelItem ->
                                 val isCurrent = settings.getActiveModel(activeProvider) == modelItem
-                                val isUserCustom = customModelsForProvider.contains(modelItem) &&
-                                    !activeProvider.presetModels.contains(modelItem)
+                                val isUserCustom = customModelsForProvider.contains(modelItem)
                                 Surface(
                                     modifier = Modifier
                                         .heightIn(min = 36.dp)
@@ -770,12 +904,30 @@ fun AiSettingsScreen(
                                 }
                             }
                         }
+
+                        if (filteredModels.size > 24) {
+                            TextButton(
+                                onClick = { showAllModels = !showAllModels },
+                                modifier = Modifier.align(Alignment.Start)
+                            ) {
+                                Text(
+                                    text = when {
+                                        showAllModels && isEn -> "SHOW FEWER MODELS"
+                                        showAllModels -> "СВЕРНУТЬ СПИСОК"
+                                        isEn -> "SHOW ALL (${filteredModels.size})"
+                                        else -> "ПОКАЗАТЬ ВСЕ (${filteredModels.size})"
+                                    },
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = NothingWhite
+                                )
+                            }
+                        }
                     }
                 }
             }
 
             // =========================================================================
-            // CARD 2: GENERAL PARAMETERS (PROMPT, VOICE & MATRIX IN ONE UNIFIED CARD)
+            // CARD 2: GENERAL PARAMETERS (PROMPT, VOICE, STT & MATRIX)
             // =========================================================================
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -789,84 +941,229 @@ fun AiSettingsScreen(
                         .padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    // Card Header + Reset Prompt Button
-                    Row(
+                    Text(
+                        text = if (isEn) "General Parameters" else "Общие параметры",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = NothingWhite,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    // Section A: Clean System Prompt Editor (regulates AI response behavior & length)
+                    Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        shape = RoundedCornerShape(16.dp),
+                        color = NothingCardElevated,
+                        border = BorderStroke(1.dp, NothingBorder)
                     ) {
-                        Text(
-                            text = if (isEn) "General Parameters" else "Общие параметры",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = NothingWhite,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
+                        Column(
                             modifier = Modifier
-                                .weight(1f)
-                                .padding(end = 8.dp)
-                        )
-                        OutlinedButton(
-                            onClick = { showResetPromptConfirm = true },
-                            modifier = Modifier
-                                .height(38.dp)
-                                .testTag("reset_prompt_button"),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, NothingBorder)
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Filled.Refresh,
-                                contentDescription = "Reset prompt",
-                                tint = NothingWhite,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (isEn) "RESET PROMPT" else "СБРОС ПРОМПТА",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = NothingWhite,
-                                maxLines = 1,
-                                softWrap = false
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
+                                    Text(
+                                        text = if (isEn) "System Prompt" else "Системный промпт",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = NothingWhite,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = if (isEn) {
+                                            "Controls the style and word count of the AI response"
+                                        } else {
+                                            "Регулирует формат и количество слов в ответе нейросети"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NothingGray
+                                    )
+                                }
+
+                                OutlinedButton(
+                                    onClick = { showResetPromptConfirm = true },
+                                    modifier = Modifier
+                                        .height(34.dp)
+                                        .testTag("reset_prompt_button"),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, NothingBorder)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Refresh,
+                                        contentDescription = "Reset prompt",
+                                        tint = NothingWhite,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = if (isEn) "RESET" else "СБРОС",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = NothingWhite,
+                                        maxLines = 1,
+                                        softWrap = false
+                                    )
+                                }
+                            }
+
+                            OutlinedTextField(
+                                value = settings.systemPrompt,
+                                onValueChange = onUpdateSystemPrompt,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("system_prompt_input"),
+                                textStyle = MaterialTheme.typography.bodyMedium.copy(
+                                    color = NothingWhite,
+                                    lineHeight = 20.sp
+                                ),
+                                minLines = 3,
+                                maxLines = 7,
+                                placeholder = {
+                                    Text(
+                                        text = if (isEn) {
+                                            OracleSettings.DEFAULT_SYSTEM_PROMPT_EN
+                                        } else {
+                                            OracleSettings.DEFAULT_SYSTEM_PROMPT_RU
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = NothingGray
+                                    )
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = NothingWhite,
+                                    unfocusedBorderColor = NothingBorder,
+                                    focusedContainerColor = NothingCard,
+                                    unfocusedContainerColor = NothingCard
+                                )
                             )
                         }
                     }
 
-                    // Section A: System Prompt & Max Words
-                    SettingSliderBlock(
-                        label = if (isEn) "Max words in answer" else "Лимит слов в ответе",
-                        valueBadge = "${settings.maxWordsLimit}",
-                        value = settings.maxWordsLimit.toFloat(),
-                        onValueChange = { onUpdateMaxWords(it.roundToInt()) },
-                        valueRange = 1f..5f,
-                        steps = 3,
-                        activeColor = NothingRed,
-                        sliderTestTag = "max_words_slider"
-                    )
-
-                    OutlinedTextField(
-                        value = settings.systemPrompt,
-                        onValueChange = onUpdateSystemPrompt,
+                    // Section A2: Post-Processing Matrix Word Limit (independent of prompt)
+                    Surface(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .testTag("system_prompt_input"),
-                        minLines = 3,
-                        maxLines = 6,
-                        label = {
-                            Text(
-                                text = if (isEn) "System prompt" else "Системный промпт",
-                                maxLines = 1,
-                                softWrap = false
-                            )
-                        },
-                        shape = RoundedCornerShape(14.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = NothingWhite,
-                            unfocusedBorderColor = NothingBorder,
-                            focusedContainerColor = NothingCardElevated,
-                            unfocusedContainerColor = NothingCardElevated
-                        )
-                    )
+                            .testTag("max_words_slider"),
+                        shape = RoundedCornerShape(16.dp),
+                        color = NothingCardElevated,
+                        border = BorderStroke(1.dp, NothingBorder)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
+                                    Text(
+                                        text = if (isEn) {
+                                            "Matrix Word Output Limit"
+                                        } else {
+                                            "Лимит вывода слов на матрицу"
+                                        },
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = NothingWhite,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = if (isEn) {
+                                            "Truncates the received answer for the LED matrix only (independent of prompt)"
+                                        } else {
+                                            "Ограничивает вывод на матрицу уже после получения ответа (не зависит от промпта)"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NothingGray
+                                    )
+                                }
+
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = NothingCard,
+                                    border = BorderStroke(1.dp, NothingBorder)
+                                ) {
+                                    val limit = settings.maxWordsLimit
+                                    val badgeText = if (isEn) {
+                                        if (limit == 1) "MAX 1 WORD" else "MAX $limit WORDS"
+                                    } else {
+                                        when (limit) {
+                                            1 -> "ДО 1 СЛОВА"
+                                            else -> "ДО $limit СЛОВ"
+                                        }
+                                    }
+                                    Text(
+                                        text = badgeText,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NothingWhite,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                (1..5).forEach { wordCount ->
+                                    val isSelected = settings.maxWordsLimit == wordCount
+                                    Surface(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(42.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .clickable { onUpdateMaxWords(wordCount) }
+                                            .testTag("max_words_chip_$wordCount"),
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (isSelected) NothingRed else NothingCard,
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (isSelected) NothingRed else NothingBorder
+                                        )
+                                    ) {
+                                        Box(
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                text = "$wordCount",
+                                                style = MaterialTheme.typography.titleSmall,
+                                                color = NothingWhite,
+                                                maxLines = 1,
+                                                softWrap = false
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     HorizontalDivider(
                         color = NothingBorder,
@@ -874,25 +1171,59 @@ fun AiSettingsScreen(
                         modifier = Modifier.padding(vertical = 2.dp)
                     )
 
-                    // Section B: Voice Capture & Pause Window
+                    // Section B: Voice Capture, STT Provider & Pause Window
                     Text(
-                        text = if (isEn) "Voice Capture & Pause" else "Запись голоса и пауза",
+                        text = if (isEn) "Voice Capture & STT Provider" else "Запись голоса и STT-провайдер",
                         style = MaterialTheme.typography.titleSmall,
                         color = NothingWhite,
                         maxLines = 1,
                         softWrap = false
                     )
 
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SttProvider.entries.forEach { stt ->
+                            val isSelected = settings.sttProvider == stt
+                            Surface(
+                                modifier = Modifier
+                                    .height(36.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { onUpdateSttProvider(stt) }
+                                    .testTag("stt_provider_${stt.name.lowercase()}"),
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isSelected) NothingWhite else NothingCardElevated,
+                                border = BorderStroke(1.dp, if (isSelected) NothingWhite else NothingBorder)
+                            ) {
+                                Box(
+                                    modifier = Modifier.padding(horizontal = 12.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = stt.getLabel(isEn),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (isSelected) MaterialTheme.colorScheme.onPrimary else NothingWhite,
+                                        maxLines = 1,
+                                        softWrap = false
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     SettingSliderBlock(
                         label = if (isEn) "Pause window for auto-send" else "Окно паузы для автоотправки",
-                        valueBadge = if (isEn) {
-                            "${String.format("%.2f", settings.silenceTimeoutMs / 1000f)} s"
-                        } else {
-                            "${String.format("%.2f", settings.silenceTimeoutMs / 1000f)} с"
+                        valueFormatter = { v ->
+                            if (isEn) {
+                                "${String.format("%.2f", v.roundToInt() / 1000f)} s"
+                            } else {
+                                "${String.format("%.2f", v.roundToInt() / 1000f)} с"
+                            }
                         },
                         value = settings.silenceTimeoutMs.toFloat(),
-                        onValueChange = { onUpdateSilenceTimeout(it.roundToInt()) },
-                        valueRange = 600f..1800f,
+                        onValueChangeCommitted = { onUpdateSilenceTimeout(it.roundToInt()) },
+                        valueRange = 600f..2000f,
                         activeColor = NothingRed,
                         sliderTestTag = "silence_timeout_slider"
                     )
@@ -963,19 +1294,21 @@ fun AiSettingsScreen(
 
                     SettingSliderBlock(
                         label = if (isEn) "Matrix LED brightness" else "Яркость светодиодов матрицы",
-                        valueBadge = "${settings.matrixBrightness} / 255",
+                        valueFormatter = { "${it.roundToInt()} / 255" },
                         value = settings.matrixBrightness.toFloat(),
-                        onValueChange = { onUpdateBrightness(it.roundToInt()) },
+                        onValueChangeCommitted = { onUpdateBrightness(it.roundToInt()) },
                         valueRange = 40f..255f,
                         activeColor = NothingWhite
                     )
 
                     SettingSliderBlock(
                         label = if (isEn) "Marquee scroll speed" else "Скорость бегущей строки",
-                        valueBadge = if (isEn) "${settings.scrollSpeedMs} ms" else "${settings.scrollSpeedMs} мс",
+                        valueFormatter = { v ->
+                            if (isEn) "${v.roundToInt()} ms" else "${v.roundToInt()} мс"
+                        },
                         value = settings.scrollSpeedMs.toFloat(),
-                        onValueChange = { onUpdateScrollSpeed(it.roundToInt()) },
-                        valueRange = 35f..150f,
+                        onValueChangeCommitted = { onUpdateScrollSpeed(it.roundToInt()) },
+                        valueRange = 35f..160f,
                         activeColor = NothingWhite
                     )
                 }
@@ -1026,14 +1359,19 @@ private fun LanguageOptionChip(
 @Composable
 private fun SettingSliderBlock(
     label: String,
-    valueBadge: String,
+    valueFormatter: (Float) -> String,
     value: Float,
-    onValueChange: (Float) -> Unit,
+    onValueChangeCommitted: (Float) -> Unit,
     valueRange: ClosedFloatingPointRange<Float>,
     activeColor: androidx.compose.ui.graphics.Color,
     steps: Int = 0,
     sliderTestTag: String? = null
 ) {
+    var localValue by remember(value) { mutableFloatStateOf(value) }
+    LaunchedEffect(value) {
+        localValue = value
+    }
+
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -1060,7 +1398,7 @@ private fun SettingSliderBlock(
                 border = BorderStroke(1.dp, NothingBorder)
             ) {
                 Text(
-                    text = valueBadge,
+                    text = valueFormatter(localValue),
                     style = MaterialTheme.typography.labelSmall,
                     color = NothingWhite,
                     maxLines = 1,
@@ -1071,8 +1409,9 @@ private fun SettingSliderBlock(
         }
 
         Slider(
-            value = value,
-            onValueChange = onValueChange,
+            value = localValue,
+            onValueChange = { localValue = it },
+            onValueChangeFinished = { onValueChangeCommitted(localValue) },
             valueRange = valueRange,
             steps = steps,
             modifier = if (sliderTestTag != null) Modifier.testTag(sliderTestTag) else Modifier,
@@ -1120,8 +1459,8 @@ fun NothingConfirmationDialog(
                 modifier = Modifier.height(42.dp),
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = NothingRed,
-                    contentColor = NothingWhite
+                    containerColor = if (isDestructive) NothingRed else NothingWhite,
+                    contentColor = if (isDestructive) NothingWhite else MaterialTheme.colorScheme.onPrimary
                 )
             ) {
                 Text(

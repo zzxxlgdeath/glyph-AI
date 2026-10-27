@@ -9,11 +9,14 @@ import com.example.data.OracleHistoryItem
 import com.example.data.OracleHistoryRepository
 import com.example.data.OracleSettings
 import com.example.data.OracleSettingsRepository
+import com.example.data.SttProvider
 import com.example.data.VoiceCaptureMode
-import com.example.data.resolveSystemSpeechLanguage
 import com.example.glyph.GlyphOracleCoordinator
+import com.example.glyph.GlyphOracleToyService
 import com.example.glyph.ToyOracleState
 import com.example.network.AiOracleClient
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -42,6 +45,8 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
     private val _isFetchingModels = MutableStateFlow(false)
     val isFetchingModels: StateFlow<Boolean> = _isFetchingModels.asStateFlow()
 
+    private var autoFetchJob: Job? = null
+
     val history: StateFlow<List<OracleHistoryItem>> = historyRepository.allHistory
         .stateIn(
             scope = viewModelScope,
@@ -49,12 +54,127 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
             initialValue = emptyList()
         )
 
+    init {
+        refreshAllConfiguredProvidersOnStartup()
+    }
+
+    private fun refreshAllConfiguredProvidersOnStartup() {
+        viewModelScope.launch {
+            val snapshot = settings.value
+            val active = snapshot.selectedProvider
+            fetchModelsInternal(
+                provider = active,
+                silent = true,
+                updateStatusIndicator = true
+            )
+            AiProvider.entries
+                .filter { it != active }
+                .forEach { provider ->
+                    val key = settings.value.getResolvedApiKey(provider)
+                    if (key.isNotBlank() || provider == AiProvider.OPENROUTER) {
+                        fetchModelsInternal(
+                            provider = provider,
+                            silent = true,
+                            updateStatusIndicator = false
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun scheduleAutoFetchModels(
+        provider: AiProvider,
+        debounceMs: Long = 500L,
+        announceSuccess: Boolean = false
+    ) {
+        autoFetchJob?.cancel()
+        autoFetchJob = viewModelScope.launch {
+            if (debounceMs > 0L) {
+                delay(debounceMs)
+            }
+            fetchModelsInternal(
+                provider = provider,
+                silent = !announceSuccess,
+                updateStatusIndicator = true
+            )
+        }
+    }
+
+    private suspend fun fetchModelsInternal(
+        provider: AiProvider,
+        silent: Boolean,
+        updateStatusIndicator: Boolean
+    ) {
+        val current = settings.value
+        val key = current.getResolvedApiKey(provider)
+        val baseUrl = current.getBaseUrl(provider)
+        val isEn = current.isEnglish
+
+        val canFetchWithoutKey = provider == AiProvider.OPENROUTER
+        if (key.isBlank() && !canFetchWithoutKey) {
+            if (!silent) {
+                _apiDiagnosticMessage.value = if (isEn) {
+                    "Enter an API key for ${provider.displayName} first"
+                } else {
+                    "Сначала введите API-ключ для ${provider.displayName}"
+                }
+            }
+            return
+        }
+
+        if (silent && !canFetchWithoutKey && key.length < 8) {
+            return
+        }
+
+        if (updateStatusIndicator) {
+            _isFetchingModels.value = true
+        }
+        if (!silent) {
+            _apiDiagnosticMessage.value = if (isEn) {
+                "Fetching models from ${provider.displayName}..."
+            } else {
+                "Загрузка актуальных моделей ${provider.displayName}..."
+            }
+        }
+
+        val result = AiOracleClient.fetchAvailableModels(provider, key, baseUrl, isEn)
+        if (updateStatusIndicator) {
+            _isFetchingModels.value = false
+        }
+
+        result.fold(
+            onSuccess = { models ->
+                settingsRepository.setFetchedModels(provider, models)
+                if (!silent) {
+                    _apiDiagnosticMessage.value = if (isEn) {
+                        "Updated ${models.size} live models from ${provider.displayName}."
+                    } else {
+                        "Список моделей ${provider.displayName} обновлен (${models.size} шт.)."
+                    }
+                }
+            },
+            onFailure = { err ->
+                if (!silent) {
+                    _apiDiagnosticMessage.value = if (isEn) {
+                        "Error loading models: ${err.message}"
+                    } else {
+                        "Ошибка загрузки моделей: ${err.message}"
+                    }
+                }
+            }
+        )
+    }
+
     fun triggerGlyphLongPress() {
         coordinator.onGlyphButtonLongPress()
     }
 
     fun stopVoiceListening() {
         coordinator.stopVoiceListening()
+    }
+
+    fun dismissError() {
+        coordinator.dismissError()
     }
 
     fun submitTextQuestion(question: String) {
@@ -80,6 +200,11 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
     fun selectProvider(provider: AiProvider) {
         _apiDiagnosticMessage.value = null
         settingsRepository.updateSettings { it.copy(selectedProvider = provider) }
+        scheduleAutoFetchModels(provider = provider, debounceMs = 80L, announceSuccess = false)
+    }
+
+    fun updateSttProvider(sttProvider: SttProvider) {
+        settingsRepository.updateSettings { it.copy(sttProvider = sttProvider) }
     }
 
     fun updateActiveModel(model: String) {
@@ -99,6 +224,13 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
         settingsRepository.updateSettings { current ->
             current.copy(customOpenAiBaseUrl = baseUrl)
         }
+        if (baseUrl.trim().startsWith("http", ignoreCase = true)) {
+            scheduleAutoFetchModels(
+                provider = AiProvider.CUSTOM_OPENAI,
+                debounceMs = 650L,
+                announceSuccess = false
+            )
+        }
     }
 
     fun applyOpenAiEndpointPreset(baseUrl: String, sampleModel: String) {
@@ -110,6 +242,11 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
                 customCompatibleModels = (listOf(sampleModel) + current.customCompatibleModels).distinct()
             )
         }
+        scheduleAutoFetchModels(
+            provider = AiProvider.CUSTOM_OPENAI,
+            debounceMs = 150L,
+            announceSuccess = true
+        )
     }
 
     fun addCustomModel(modelId: String) {
@@ -135,46 +272,12 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun fetchModelsFromApi() {
-        val current = settings.value
-        val provider = current.selectedProvider
-        val key = current.getResolvedApiKey(provider)
-        val baseUrl = current.getBaseUrl(provider)
-        val isEn = current.isEnglish
-
-        if (key.isBlank()) {
-            _apiDiagnosticMessage.value = if (isEn) {
-                "Enter an API key for ${provider.displayName} first"
-            } else {
-                "Сначала введите API-ключ для ${provider.displayName}"
-            }
-            return
-        }
-
-        _isFetchingModels.value = true
-        _apiDiagnosticMessage.value = if (isEn) {
-            "Fetching models from ${provider.displayName}..."
-        } else {
-            "Загрузка списка моделей с сервера ${provider.displayName}..."
-        }
-        viewModelScope.launch {
-            val result = AiOracleClient.fetchAvailableModels(provider, key, baseUrl, isEn)
-            _isFetchingModels.value = false
-            result.fold(
-                onSuccess = { models ->
-                    settingsRepository.addFetchedModels(provider, models)
-                    _apiDiagnosticMessage.value = if (isEn) {
-                        "Loaded ${models.size} models (${provider.displayName}). Tap any chip below."
-                    } else {
-                        "Загружено моделей (${provider.displayName}): ${models.size}. Выберите любую из списка ниже."
-                    }
-                },
-                onFailure = { err ->
-                    _apiDiagnosticMessage.value = if (isEn) {
-                        "Error loading models: ${err.message}"
-                    } else {
-                        "Ошибка загрузки моделей: ${err.message}"
-                    }
-                }
+        autoFetchJob?.cancel()
+        autoFetchJob = viewModelScope.launch {
+            fetchModelsInternal(
+                provider = settings.value.selectedProvider,
+                silent = false,
+                updateStatusIndicator = true
             )
         }
     }
@@ -235,9 +338,17 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
                 AiProvider.CUSTOM_OPENAI -> current.copy(customCompatibleKey = key)
             }
         }
+        if (key.trim().length >= 8) {
+            scheduleAutoFetchModels(
+                provider = provider,
+                debounceMs = 550L,
+                announceSuccess = true
+            )
+        }
     }
 
     fun clearAllApiKeys() {
+        autoFetchJob?.cancel()
         settingsRepository.clearAllApiKeys()
         val isEn = settings.value.isEnglish
         _apiDiagnosticMessage.value = if (isEn) {
@@ -272,9 +383,10 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
         settingsRepository.updateSettings { it.copy(silenceTimeoutMs = timeoutMs.coerceIn(600, 2000)) }
     }
 
-    fun updateSpeechLanguage(lang: String) {
+    fun updateUiLanguage(lang: String) {
+        val cleanUi = if (lang.startsWith("en", ignoreCase = true)) "en" else "ru"
         settingsRepository.updateSettings { current ->
-            val switchingToEn = lang.startsWith("en", ignoreCase = true)
+            val switchingToEn = cleanUi == "en"
             val updatedPrompt = when {
                 switchingToEn && current.systemPrompt == OracleSettings.DEFAULT_SYSTEM_PROMPT_RU ->
                     OracleSettings.DEFAULT_SYSTEM_PROMPT_EN
@@ -283,14 +395,25 @@ class OracleViewModel(application: Application) : AndroidViewModel(application) 
                 else -> current.systemPrompt
             }
             current.copy(
-                speechLanguage = lang,
+                uiLanguage = cleanUi,
                 systemPrompt = updatedPrompt
             )
         }
     }
 
+    fun updateSpeechLanguage(lang: String) {
+        settingsRepository.updateSettings { current ->
+            current.copy(speechLanguage = lang)
+        }
+    }
+
     fun updateVoiceCaptureMode(mode: VoiceCaptureMode) {
         settingsRepository.updateSettings { it.copy(voiceCaptureMode = mode) }
+    }
+
+    fun updateBackgroundServiceEnabled(enabled: Boolean) {
+        settingsRepository.updateSettings { it.copy(backgroundServiceEnabled = enabled) }
+        GlyphOracleToyService.syncBackgroundServiceState(getApplication())
     }
 
     fun deleteHistoryItem(id: Long) {

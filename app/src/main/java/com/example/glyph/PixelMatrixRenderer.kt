@@ -1,19 +1,21 @@
 package com.example.glyph
 
+import java.text.Normalizer
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 /**
  * Renders 25x25 LED frames (int[625], brightness 0..255) for the Nothing Phone (3) Glyph Matrix.
- * Supports full Cyrillic (А-Я, Ё), Latin (A-Z), Digits (0-9), and symbols,
- * as well as procedural animations for IDLE, LISTENING, THINKING, and ERROR states.
+ * Supports full Cyrillic (А-Я, Ё, Й), Latin (A-Z with NFD diacritic stripping), Digits (0-9),
+ * and extended symbols, plus procedural animations for IDLE, LISTENING, THINKING, and ERROR states.
  */
 object PixelMatrixRenderer {
     const val MATRIX_SIZE = 25
     const val TOTAL_PIXELS = MATRIX_SIZE * MATRIX_SIZE
+
+    private val COMBINING_MARKS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
 
     // 5x7 pixel font map (each string has 7 rows of 5 characters: '#' = lit, '.' = off)
     private val FONT_5X7: Map<Char, List<String>> = mapOf(
@@ -96,35 +98,78 @@ object PixelMatrixRenderer {
         ' ' to listOf("...", "...", "...", "...", "...", "...", "..."),
         '.' to listOf("...", "...", "...", "...", "...", ".#.", ".#."),
         ',' to listOf("...", "...", "...", "...", "...", ".#.", "#.."),
+        '\'' to listOf(".#.", ".#.", "...", "...", "...", "...", "..."),
         ':' to listOf("...", ".#.", "...", "...", "...", ".#.", "..."),
+        ';' to listOf("...", ".#.", "...", "...", "...", ".#.", "#.."),
         '!' to listOf(".#.", ".#.", ".#.", ".#.", ".#.", "...", ".#."),
         '?' to listOf(".###.", "#...#", "....#", "..##.", "..#..", ".....", "..#.."),
         '-' to listOf(".....", ".....", ".....", ".###.", ".....", ".....", "....."),
+        '_' to listOf(".....", ".....", ".....", ".....", ".....", ".....", "#####"),
         '+' to listOf(".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
         '=' to listOf(".....", ".....", "#####", ".....", "#####", ".....", "....."),
         '/' to listOf("....#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...."),
         '%' to listOf("##..#", "##.#.", "...#.", "..#..", ".#...", ".#.##", "#..##"),
         '$' to listOf("..#..", ".####", "#.#..", ".###.", "..#.#", "####.", "..#.."),
+        '€' to listOf(".###.", "#....", "####.", "#....", "####.", "#....", ".###."),
+        '&' to listOf(".##..", "#..#.", ".##..", ".###.", "#.#.#", "#..#.", ".##.#"),
+        '(' to listOf("..#.", ".#..", "#...", "#...", "#...", ".#..", "..#."),
+        ')' to listOf(".#..", "..#.", "...#", "...#", "...#", "..#.", ".#.."),
+        '°' to listOf(".##.", "#..#", "#..#", ".##.", "....", "....", "...."),
+        '×' to listOf(".....", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "....."),
+        '№' to listOf("#..##", "##.#.", "#.##.", "#..#.", "#..##", ".....", "....."),
+        '#' to listOf(".#.#.", "#####", ".#.#.", ".#.#.", "#####", ".#.#.", "....."),
+        '@' to listOf(".###.", "#...#", "#.###", "#.#.#", "#.###", "#....", ".###."),
         '>' to listOf("#....", ".#...", "..#..", "...#.", "..#..", ".#...", "#...."),
         '<' to listOf("....#", "...#.", "..#..", ".#...", "..#..", "...#.", "....#"),
         '*' to listOf(".....", "#.#.#", ".###.", "#####", ".###.", "#.#.#", ".....")
     )
 
     /**
+     * Normalizes text for the 5x7 pixel font:
+     * - Converts to uppercase
+     * - Preserves Russian 'Й' and 'Ё' while stripping Latin diacritics via NFD (e.g. É -> E, Ü -> U)
+     * - Normalizes typographic dashes and apostrophes
+     */
+    fun normalizeForMatrix(text: String): String {
+        val raw = text.trim().uppercase()
+        if (raw.isEmpty()) return ""
+
+        val protectedCyrillic = raw
+            .replace("Й", "\uE001")
+            .replace("Ё", "\uE002")
+            .replace('—', '-')
+            .replace('–', '-')
+            .replace('−', '-')
+            .replace('’', '\'')
+            .replace('‘', '\'')
+
+        val nfd = Normalizer.normalize(protectedCyrillic, Normalizer.Form.NFD)
+        val stripped = COMBINING_MARKS_REGEX.replace(nfd, "")
+
+        return stripped
+            .replace("\uE001", "Й")
+            .replace("\uE002", "Ё")
+            .replace('Ł', 'L')
+            .replace('Ø', 'O')
+            .replace("Æ", "AE")
+            .replace("Œ", "OE")
+            .replace("ß", "SS")
+    }
+
+    /**
      * Checks if a pixel coordinate (x, y) is within the physical Nothing Phone (3) circular LED allocation.
-     * Nothing Phone (3) has a 25x25 grid housed in a circular layout (radius ~12.5 from center (12, 12)).
      */
     fun isInsideGlyphCircle(x: Int, y: Int): Boolean {
         val dx = x - 12.0
         val dy = y - 12.0
-        return (dx * dx + dy * dy) <= 160.0 // ~12.65 radius covers the active 25x25 matrix
+        return (dx * dx + dy * dy) <= 160.0
     }
 
     /**
      * Measures the total pixel width of a text string rendered in 5x7 font.
      */
     fun measureTextWidth(text: String): Int {
-        val clean = text.trim().uppercase()
+        val clean = normalizeForMatrix(text)
         if (clean.isEmpty()) return 0
         var width = 0
         clean.forEachIndexed { index, ch ->
@@ -137,15 +182,11 @@ object PixelMatrixRenderer {
 
     /**
      * Determines whether the answer is short enough to be displayed statically on the 25x25 matrix.
-     * Answers up to 4 characters (e.g., "ДА", "НЕТ", "YES", "NO", "42", "5070") fit statically without scrolling.
      */
     fun shouldDisplayStatically(answer: String): Boolean {
-        val clean = answer.trim().uppercase()
+        val clean = normalizeForMatrix(answer)
         if (clean.isEmpty()) return true
-        // Single short token of <= 4 chars (width <= 23px) fits on one centered row
         if (clean.length <= 4 && measureTextWidth(clean) <= 23) return true
-        // Two short words where each word is <= 4 chars (e.g. "RTX 5070") can either scroll or stack;
-        // per user choice: short answers (ДА, НЕТ, numbers) are static, longer answers scroll via marquee.
         return false
     }
 
@@ -154,11 +195,10 @@ object PixelMatrixRenderer {
      */
     fun renderStaticAnswer(text: String, brightness: Int = 255): IntArray {
         val frame = IntArray(TOTAL_PIXELS)
-        val clean = text.trim().uppercase()
+        val clean = normalizeForMatrix(text)
         val clampedBrightness = brightness.coerceIn(10, 255)
         val dimBrightness = (clampedBrightness * 0.28f).roundToInt().coerceAtLeast(15)
 
-        // Subtle top and bottom ornamental glyph ticks
         for (x in 9..15) {
             setPixel(frame, x, 2, dimBrightness)
             setPixel(frame, x, 22, dimBrightness)
@@ -176,7 +216,6 @@ object PixelMatrixRenderer {
 
     /**
      * Renders a single frame of a scrolling marquee for longer answers (e.g. "RTX 5070").
-     * @param scrollOffsetPx Current horizontal scroll offset in pixels (starts at -MATRIX_SIZE and moves to textWidth + MATRIX_SIZE)
      */
     fun renderMarqueeAnswer(
         text: String,
@@ -184,11 +223,10 @@ object PixelMatrixRenderer {
         brightness: Int = 255
     ): IntArray {
         val frame = IntArray(TOTAL_PIXELS)
-        val clean = text.trim().uppercase()
+        val clean = normalizeForMatrix(text)
         val clampedBrightness = brightness.coerceIn(10, 255)
         val railBrightness = (clampedBrightness * 0.22f).roundToInt().coerceAtLeast(12)
 
-        // Top and bottom guide rails for the ticker
         for (x in 4..20 step 2) {
             setPixel(frame, x, 5, railBrightness)
             setPixel(frame, x, 19, railBrightness)
@@ -210,7 +248,6 @@ object PixelMatrixRenderer {
         val coreB = (maxB * pulse).roundToInt()
         val ringB = (maxB * 0.35f).roundToInt()
 
-        // Outer diamond ring
         val radius = 8
         for (i in 0..radius) {
             setPixel(frame, 12 + i, 12 - radius + i, ringB)
@@ -219,14 +256,12 @@ object PixelMatrixRenderer {
             setPixel(frame, 12 - i, 12 + radius - i, ringB)
         }
 
-        // Center oracle pupil (3x3 cross/diamond)
         setPixel(frame, 12, 12, maxB)
         setPixel(frame, 11, 12, coreB)
         setPixel(frame, 13, 12, coreB)
         setPixel(frame, 12, 11, coreB)
         setPixel(frame, 12, 13, coreB)
 
-        // Corner ticks
         val cornerB = (maxB * 0.5f).roundToInt()
         setPixel(frame, 12, 2, cornerB)
         setPixel(frame, 12, 22, cornerB)
@@ -242,10 +277,8 @@ object PixelMatrixRenderer {
     fun renderListeningWave(tick: Int, rmsDb: Float, brightness: Int = 255): IntArray {
         val frame = IntArray(TOTAL_PIXELS)
         val maxB = brightness.coerceIn(30, 255)
-        // Normalize rmsDb (-2..10 dB typical from SpeechRecognizer) into 0.15..1.0
         val energy = ((rmsDb + 2f) / 10f).coerceIn(0.18f, 1.0f)
 
-        // Draw 7 vertical equalizer bars across the 25x25 matrix
         val barColumns = listOf(3, 6, 9, 12, 15, 18, 21)
         barColumns.forEachIndexed { idx, colX ->
             val phase = tick * 0.45f + idx * 0.9f
@@ -263,7 +296,6 @@ object PixelMatrixRenderer {
             }
         }
 
-        // Pulsing recording indicator dot at top center
         if (tick % 6 < 4) {
             setPixel(frame, 12, 2, maxB)
             setPixel(frame, 11, 2, maxB / 2)
@@ -273,13 +305,12 @@ object PixelMatrixRenderer {
     }
 
     /**
-     * Renders the THINKING state: orbiting neural radar while waiting for Groq / Gemini / OpenRouter.
+     * Renders the THINKING state: orbiting neural radar while waiting for AI response.
      */
     fun renderThinkingSpinner(tick: Int, brightness: Int = 255): IntArray {
         val frame = IntArray(TOTAL_PIXELS)
         val maxB = brightness.coerceIn(30, 255)
 
-        // Orbiting ring of 12 points around center (12, 12) with radius 7
         val numDots = 12
         val radius = 7.0
         for (i in 0 until numDots) {
@@ -292,7 +323,6 @@ object PixelMatrixRenderer {
             setPixel(frame, x, y, b)
         }
 
-        // Inner pulsing AI core
         val innerB = (maxB * (0.4f + 0.6f * abs(sin(tick * 0.3f)))).roundToInt()
         for (dx in -1..1) {
             for (dy in -1..1) {
@@ -305,7 +335,7 @@ object PixelMatrixRenderer {
     }
 
     /**
-     * Renders an ERROR state on the 25x25 matrix ("!" + "ERR").
+     * Renders an ERROR state on the 25x25 matrix ("ERR").
      */
     fun renderErrorFrame(tick: Int, brightness: Int = 255): IntArray {
         val frame = IntArray(TOTAL_PIXELS)
@@ -356,16 +386,17 @@ object PixelMatrixRenderer {
 
     /**
      * Converts a 25x25 UI brightness array (0..255) into the Nothing Phone (3) IGlyphService
-     * hardware brightness range (0..2047, i.e., `2047 * brightness / 255`), matching
-     * `GlyphMatrixUtils.LetterMatrix.fillIn` and `GlyphMatrixUtils.convertToGlyphMatrix` in the SDK.
+     * hardware brightness range (0..2047) into the provided `outBuffer` (or a new array).
      */
-    fun toHardwareMatrixArray(uiFrame: IntArray): IntArray {
-        val hw = IntArray(TOTAL_PIXELS)
-        val limit = minOf(uiFrame.size, TOTAL_PIXELS)
+    fun toHardwareMatrixArray(uiFrame: IntArray, outBuffer: IntArray = IntArray(TOTAL_PIXELS)): IntArray {
+        val limit = minOf(uiFrame.size, outBuffer.size, TOTAL_PIXELS)
         for (i in 0 until limit) {
             val b = uiFrame[i].coerceIn(0, 255)
-            hw[i] = (b * 2047) / 255
+            outBuffer[i] = (b * 2047) / 255
         }
-        return hw
+        for (i in limit until outBuffer.size) {
+            outBuffer[i] = 0
+        }
+        return outBuffer
     }
 }

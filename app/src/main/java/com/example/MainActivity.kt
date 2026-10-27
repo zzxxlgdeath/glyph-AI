@@ -2,8 +2,10 @@ package com.example
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -17,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -74,7 +77,10 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
+        )
         setContent {
             MyApplicationTheme {
                 GlyphOracleApp()
@@ -84,7 +90,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        GlyphOracleToyService.ensurePersistentForegroundMicService(applicationContext)
+        GlyphOracleToyService.syncBackgroundServiceState(applicationContext)
         GlyphOracleCoordinator.getInstance(applicationContext).onAppForeground()
     }
 
@@ -121,7 +127,7 @@ fun GlyphOracleApp(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            GlyphOracleToyService.ensurePersistentForegroundMicService(context)
+            GlyphOracleToyService.syncBackgroundServiceState(context)
         }
     }
 
@@ -131,7 +137,7 @@ fun GlyphOracleApp(
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
         if (hasMicPerm) {
-            GlyphOracleToyService.ensurePersistentForegroundMicService(context)
+            GlyphOracleToyService.syncBackgroundServiceState(context)
         } else {
             initialPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
@@ -141,7 +147,7 @@ fun GlyphOracleApp(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            GlyphOracleToyService.ensurePersistentForegroundMicService(context)
+            GlyphOracleToyService.syncBackgroundServiceState(context)
             viewModel.triggerGlyphLongPress()
         } else {
             scope.launch {
@@ -162,7 +168,7 @@ fun GlyphOracleApp(
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
         if (hasMicPerm) {
-            GlyphOracleToyService.ensurePersistentForegroundMicService(context)
+            GlyphOracleToyService.syncBackgroundServiceState(context)
             viewModel.triggerGlyphLongPress()
         } else {
             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
@@ -170,7 +176,9 @@ fun GlyphOracleApp(
     }
 
     Scaffold(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding(),
         containerColor = NothingBlack,
         contentWindowInsets = WindowInsets.safeDrawing,
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
@@ -284,7 +292,8 @@ fun GlyphOracleApp(
                     onStopListening = { viewModel.stopVoiceListening() },
                     onSubmitTextQuestion = { viewModel.submitTextQuestion(it) },
                     onReplayAnswer = { q, a -> viewModel.previewAnswerDirectly(q, a) },
-                    onOpenAiSettings = { selectedTab = 1 }
+                    onOpenAiSettings = { selectedTab = 1 },
+                    onDismissError = { viewModel.dismissError() }
                 )
 
                 1 -> AiSettingsScreen(
@@ -309,8 +318,11 @@ fun GlyphOracleApp(
                     onUpdateBrightness = { viewModel.updateMatrixBrightness(it) },
                     onUpdateScrollSpeed = { viewModel.updateScrollSpeedMs(it) },
                     onUpdateSilenceTimeout = { viewModel.updateSilenceTimeoutMs(it) },
+                    onUpdateUiLanguage = { viewModel.updateUiLanguage(it) },
                     onUpdateSpeechLanguage = { viewModel.updateSpeechLanguage(it) },
-                    onUpdateVoiceCaptureMode = { viewModel.updateVoiceCaptureMode(it) }
+                    onUpdateSttProvider = { viewModel.updateSttProvider(it) },
+                    onUpdateVoiceCaptureMode = { viewModel.updateVoiceCaptureMode(it) },
+                    onUpdateBackgroundServiceEnabled = { viewModel.updateBackgroundServiceEnabled(it) }
                 )
 
                 2 -> HistoryScreen(

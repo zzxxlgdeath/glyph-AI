@@ -20,6 +20,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.data.OracleSettingsRepository
 import com.nothing.ketchum.GlyphToy
 
 /**
@@ -27,14 +28,8 @@ import com.nothing.ketchum.GlyphToy
  * `<action android:name="com.nothing.glyph.TOY"/>`, `com.nothing.glyph.toy.longpress = 1`,
  * and `android:foregroundServiceType="microphone"`.
  *
- * Crucial Android 14/15/16 (`targetSdk = 36`) Microphone Architecture:
- * - Android 14+ only allows starting a `FOREGROUND_SERVICE_TYPE_MICROPHONE` while the app has a visible
- *   Activity in the foreground. If a service drops its foreground state in `onUnbind()` while the app is
- *   in the background, Android blocks subsequent `startForeground(MICROPHONE)` calls, causing only the
- *   1st request after exiting the app to work.
- * - Therefore, `MainActivity` starts this service via `ensurePersistentForegroundMicService(context)`
- *   while visible, and `onUnbind()` keeps the foreground microphone state alive (`return true` + `onRebind`)
- *   so the 2nd, 3rd, and Nth requests work reliably even hours after exiting the app or locking the screen.
+ * Supports both standard on-demand Toy binding (`START_NOT_STICKY`) and an opt-in persistent
+ * foreground microphone mode (`backgroundServiceEnabled`) for lock-screen voice capture on Android 14+.
  */
 class GlyphOracleToyService : Service() {
 
@@ -74,7 +69,6 @@ class GlyphOracleToyService : Service() {
         super.onCreate()
         coordinator = GlyphOracleCoordinator.getInstance(applicationContext)
         ensureNotificationChannel()
-        promoteToForegroundMicrophoneService()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -96,11 +90,6 @@ class GlyphOracleToyService : Service() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         coordinator.onToyServiceUnbind()
-        // IMPORTANT: Do NOT call stopForeground() here!
-        // Keeping FOREGROUND_SERVICE_TYPE_MICROPHONE active while the app is in the background
-        // ensures Android 14/15/16 permits microphone capture on the 2nd, 3rd, and all subsequent
-        // Glyph Toy activations without reopening MainActivity.
-        // Returning `true` ensures `onRebind()` is invoked when Nothing OS binds again.
         return true
     }
 
@@ -128,7 +117,7 @@ class GlyphOracleToyService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (_: Throwable) {
-            // Ignored if OS restricts foreground promotion in specific states
+            // Ignored if OS restricts foreground promotion in specific background states
         }
     }
 
@@ -147,19 +136,32 @@ class GlyphOracleToyService : Service() {
     private fun ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java) ?: return
+            runCatching { manager.deleteNotificationChannel("glyph_oracle_mic_channel") }
+            val isEn = OracleSettingsRepository
+                .getInstance(applicationContext)
+                .settings.value.isEnglish
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Glyph AI Oracle Active",
-                NotificationManager.IMPORTANCE_LOW
+                "Glyph AI Oracle",
+                NotificationManager.IMPORTANCE_MIN
             ).apply {
-                description = "Постоянный доступ к микрофону для Glyph Matrix 25x25"
+                description = if (isEn) {
+                    "Microphone access for Nothing Glyph Toy"
+                } else {
+                    "Доступ к микрофону для Nothing Glyph Toy"
+                }
                 setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
             }
             manager.createNotificationChannel(channel)
         }
     }
 
     private fun buildForegroundNotification(): Notification {
+        val isEn = OracleSettingsRepository
+            .getInstance(applicationContext)
+            .settings.value.isEnglish
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -172,25 +174,31 @@ class GlyphOracleToyService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("Glyph Oracle • 25×25")
-            .setContentText("Готов к голосовым вопросам по кнопке Glyph Button")
+            .setContentTitle("Glyph Oracle")
+            .setContentText(
+                if (isEn) {
+                    "Ready for voice questions via Glyph Button"
+                } else {
+                    "Готов к голосовым вопросам по кнопке Glyph Button"
+                }
+            )
             .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setOngoing(true)
             .setSilent(true)
             .build()
     }
 
     companion object {
-        private const val CHANNEL_ID = "glyph_oracle_mic_channel"
+        private const val CHANNEL_ID = "glyph_oracle_mic_channel_silent"
         private const val NOTIFICATION_ID = 2525
 
         /**
-         * Starts `GlyphOracleToyService` as a persistent `FOREGROUND_SERVICE_TYPE_MICROPHONE`
-         * while `MainActivity` is visible in the foreground. This grants the process continuous
-         * background & lock-screen microphone access on Android 14/15/16 for unlimited requests.
+         * Ensures the foreground microphone service is started while the app has microphone
+         * permission so lock-screen Glyph Button voice capture works seamlessly on Android 14+.
          */
-        fun ensurePersistentForegroundMicService(context: Context) {
+        fun syncBackgroundServiceState(context: Context) {
             val appCtx = context.applicationContext
             val hasMicPerm = ContextCompat.checkSelfPermission(
                 appCtx,
@@ -198,8 +206,8 @@ class GlyphOracleToyService : Service() {
             ) == PackageManager.PERMISSION_GRANTED
             if (!hasMicPerm) return
 
+            val serviceIntent = Intent(appCtx, GlyphOracleToyService::class.java)
             try {
-                val serviceIntent = Intent(appCtx, GlyphOracleToyService::class.java)
                 ContextCompat.startForegroundService(appCtx, serviceIntent)
             } catch (_: Throwable) {
             }

@@ -5,30 +5,37 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AutomaticGainControl
-import android.media.audiofx.NoiseSuppressor
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
  * Direct hardware microphone recorder using `android.media.AudioRecord`.
  *
- * Speed & Reliability Optimizations:
- * - Configurable silence pause window (`silenceTimeoutMs`, default 1050ms) for snappy auto-stop.
- * - Automatically trims trailing post-speech silence from the recorded PCM buffer before encoding
- *   to WAV, cutting payload size by 30-50% for faster upload to Whisper / Gemini / OpenAI.
- * - Skips first 180ms to avoid haptic motor buzz (`vibrateShortTick`) and physical button click.
- * - Hardware `AutomaticGainControl` + software 16-bit PCM peak normalization.
+ * Speed & Sensitivity Optimizations:
+ * - Uses `MediaRecorder.AudioSource.MIC` as primary source with hardware AGC (and without
+ *   aggressive hardware NoiseSuppressor that suppresses off-axis speech when holding the phone
+ *   with the rear Glyph Matrix facing the user).
+ * - High-sensitivity VAD (`onsetThreshold` 32..110 RMS) so normal and quiet conversational speech
+ *   is captured effortlessly without raising one's voice.
+ * - Strict cancellation (`isCancelled` + `sessionId`) so `stopCancel()` never triggers completion callbacks.
+ * - Top-of-loop deadline checks and negative `AudioRecord.read()` error handling (`ERROR_DEAD_OBJECT`, etc.)
+ *   to prevent infinite loops on hardware disconnect.
+ * - Trims leading and trailing silence while preserving generous pre-roll (~250ms) and post-roll (~280ms).
  */
 class LockScreenAudioRecorder(
     private val scope: CoroutineScope,
@@ -39,17 +46,23 @@ class LockScreenAudioRecorder(
     private val onError: (String) -> Unit
 ) {
     private var recordingJob: Job? = null
+    private val activeSessionId = AtomicLong(0L)
 
     @Volatile
     private var shouldStopEarly: Boolean = false
 
+    @Volatile
+    private var isCancelled: Boolean = false
+
     val isRecording: Boolean
-        get() = recordingJob?.isActive == true
+        get() = recordingJob?.isActive == true && !isCancelled
 
     @SuppressLint("MissingPermission")
     fun start() {
         stopCancel()
         shouldStopEarly = false
+        isCancelled = false
+        val sessionIdToken = activeSessionId.incrementAndGet()
 
         recordingJob = scope.launch(Dispatchers.IO) {
             val sampleRate = 16_000
@@ -61,11 +74,13 @@ class LockScreenAudioRecorder(
 
             var audioRecord: AudioRecord? = null
             var agc: AutomaticGainControl? = null
-            var noiseSuppressor: NoiseSuppressor? = null
 
             var recordedPcmBytes: ByteArray? = null
+            var firstVoiceBytePosition = 0
             var lastVoiceBytePosition = 0
+            var speechStarted = false
             var maxPeakObserved = 0
+            var maxRmsObserved = 0.0
             var errorMessage: String? = null
 
             try {
@@ -83,16 +98,10 @@ class LockScreenAudioRecorder(
                         "Не удалось инициализировать микрофон"
                     }
                 } else {
-                    val sessionId = audioRecord.audioSessionId
+                    val audioSessionId = audioRecord.audioSessionId
                     try {
                         if (AutomaticGainControl.isAvailable()) {
-                            agc = AutomaticGainControl.create(sessionId)?.apply { enabled = true }
-                        }
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        if (NoiseSuppressor.isAvailable()) {
-                            noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
+                            agc = AutomaticGainControl.create(audioSessionId)?.apply { enabled = true }
                         }
                     } catch (_: Throwable) {
                     }
@@ -105,28 +114,53 @@ class LockScreenAudioRecorder(
                             "Запись с микрофона заблокирована системой. Откройте приложение один раз."
                         }
                     } else {
-                        val pcmStream = ByteArrayOutputStream(sampleRate * 2 * 5)
-                        val shortBuffer = ShortArray(512) // 32ms per chunk at 16kHz for faster responsiveness
+                        val pcmStream = ByteArrayOutputStream(sampleRate * 2 * 6)
+                        val shortBuffer = ShortArray(512) // 32ms per chunk at 16kHz
                         val byteChunk = ByteArray(shortBuffer.size * 2)
 
                         val startTime = System.currentTimeMillis()
                         val effectiveSilenceWindow = silenceTimeoutMs.coerceIn(600L, 2000L)
-                        var speechStarted = false
                         var speechStartTime = 0L
                         var lastVoiceTimestamp = startTime
-                        var consecutiveVoiceChunks = 0
-                        var noiseFloorRms = 115.0
+                        var noiseFloorRms = 28.0
+                        var peakSpeechRms = 0.0
 
-                        while (isActive && !shouldStopEarly) {
+                        while (isActive && !shouldStopEarly && !isCancelled) {
+                            val loopNow = System.currentTimeMillis()
+                            val loopElapsed = loopNow - startTime
+
+                            // Wait up to 5.5s for the user to start speaking
+                            if (!speechStarted && loopElapsed > 5_500L) {
+                                break
+                            }
+                            // Max active speech duration 9.0s after speech onset, or 12.5s overall safety cap
+                            if (speechStarted && (loopNow - speechStartTime) > 9_000L) {
+                                break
+                            }
+                            if (loopElapsed > 12_500L) {
+                                break
+                            }
+
                             val readCount = audioRecord.read(shortBuffer, 0, shortBuffer.size)
-                            if (readCount <= 0) continue
+                            if (readCount < 0) {
+                                errorMessage = if (isEnglish) {
+                                    "Microphone hardware read error (code $readCount)"
+                                } else {
+                                    "Ошибка чтения с микрофона (код $readCount)"
+                                }
+                                break
+                            }
+                            if (readCount == 0) {
+                                delay(10L)
+                                continue
+                            }
 
                             val now = System.currentTimeMillis()
                             val elapsed = now - startTime
 
-                            // Skip the first 180ms so the 35ms haptic vibration motor and physical
-                            // Glyph Button click on the back of the phone are excluded.
-                            if (elapsed < 180L) {
+                            // Skip only the first 90ms so the initial 25ms haptic tick is excluded
+                            // without clipping users who begin speaking immediately.
+                            if (elapsed < 90L) {
                                 continue
                             }
 
@@ -141,67 +175,69 @@ class LockScreenAudioRecorder(
                                 byteChunk[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
                             }
 
-                            if (chunkPeak > maxPeakObserved) {
-                                maxPeakObserved = chunkPeak
-                            }
+                            val chunkStartBytePos = pcmStream.size()
                             pcmStream.write(byteChunk, 0, readCount * 2)
 
                             val rms = sqrt(sumSquares / readCount)
-
-                            // Smoothly adapt ambient noise floor without letting loud voice spike it
-                            if (!speechStarted && elapsed < 500L && rms < 300.0) {
-                                noiseFloorRms = (noiseFloorRms * 0.75) + (rms * 0.25)
-                            } else if (rms < noiseFloorRms) {
-                                noiseFloorRms = (noiseFloorRms * 0.85) + (rms * 0.15)
+                            if (chunkPeak > maxPeakObserved) {
+                                maxPeakObserved = chunkPeak
                             }
-                            noiseFloorRms = noiseFloorRms.coerceIn(50.0, 250.0)
+                            if (rms > maxRmsObserved) {
+                                maxRmsObserved = rms
+                            }
 
-                            val onsetThreshold = (noiseFloorRms * 1.70).coerceIn(115.0, 380.0)
-                            val sustainThreshold = (noiseFloorRms * 1.28).coerceIn(80.0, 250.0)
+                            // Track ambient floor conservatively so user speech never inflates noiseFloorRms
+                            if (rms < noiseFloorRms) {
+                                noiseFloorRms = (noiseFloorRms * 0.72) + (rms * 0.28)
+                            } else if (!speechStarted && rms < noiseFloorRms * 1.28) {
+                                noiseFloorRms = (noiseFloorRms * 0.90) + (rms * 0.10)
+                            } else if (speechStarted && rms < noiseFloorRms * 1.15) {
+                                noiseFloorRms = (noiseFloorRms * 0.94) + (rms * 0.06)
+                            }
+                            noiseFloorRms = noiseFloorRms.coerceIn(12.0, 80.0)
+
+                            val onsetThreshold = max(noiseFloorRms * 1.38, noiseFloorRms + 14.0)
+                                .coerceIn(32.0, 110.0)
 
                             if (!speechStarted) {
-                                if (rms > onsetThreshold || chunkPeak > 1050) {
-                                    consecutiveVoiceChunks++
-                                    if (consecutiveVoiceChunks >= 2) {
-                                        speechStarted = true
-                                        speechStartTime = now
-                                        lastVoiceTimestamp = now
-                                        lastVoiceBytePosition = pcmStream.size()
-                                    }
-                                } else {
-                                    consecutiveVoiceChunks = 0
+                                if (rms > onsetThreshold || chunkPeak > 210) {
+                                    speechStarted = true
+                                    speechStartTime = now
+                                    lastVoiceTimestamp = now
+                                    peakSpeechRms = rms
+                                    firstVoiceBytePosition = max(0, chunkStartBytePos - (readCount * 2))
+                                    lastVoiceBytePosition = pcmStream.size()
                                 }
                             } else {
-                                if (rms > sustainThreshold || chunkPeak > 700) {
+                                if (rms > peakSpeechRms) {
+                                    peakSpeechRms = rms
+                                }
+                                val sustainThreshold = max(
+                                    noiseFloorRms * 1.25,
+                                    min(peakSpeechRms * 0.20, 115.0)
+                                ).coerceIn(26.0, 120.0)
+
+                                if (rms > sustainThreshold || chunkPeak > 175) {
                                     lastVoiceTimestamp = now
                                     lastVoiceBytePosition = pcmStream.size()
                                 }
                             }
 
-                            // Map RMS to -2..10 dB scale for the 25x25 LED matrix wave animation
-                            val normalizedDb = if (rms > 10.0) {
-                                ((20.0 * log10(rms / 120.0)).toFloat()).coerceIn(-2f, 10f)
+                            val normalizedDb = if (rms > 8.0) {
+                                ((20.0 * log10(rms / 45.0)).toFloat()).coerceIn(-2f, 10f)
                             } else {
                                 -2f
                             }
-                            onRmsChanged(normalizedDb)
+                            if (!isCancelled && activeSessionId.get() == sessionIdToken) {
+                                onRmsChanged(normalizedDb)
+                            }
 
-                            // Fast auto-stop once the user pauses for silenceTimeoutMs (default ~1.05s)
+                            // Auto-stop once the user pauses for silenceTimeoutMs after speaking
                             if (
                                 speechStarted &&
                                 (now - lastVoiceTimestamp) > effectiveSilenceWindow &&
-                                (now - speechStartTime) > 550L
+                                (now - speechStartTime) > 420L
                             ) {
-                                break
-                            }
-
-                            // Wait up to 5.2s for the user to start speaking
-                            if (!speechStarted && elapsed > 5200L) {
-                                break
-                            }
-
-                            // Maximum total recording duration 9.5s
-                            if (elapsed > 9_500L) {
                                 break
                             }
                         }
@@ -214,6 +250,8 @@ class LockScreenAudioRecorder(
                         recordedPcmBytes = pcmStream.toByteArray()
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 errorMessage = if (isEnglish) {
                     "Audio record error: ${t.localizedMessage ?: "unknown"}"
@@ -226,14 +264,16 @@ class LockScreenAudioRecorder(
                 } catch (_: Throwable) {
                 }
                 try {
-                    noiseSuppressor?.release()
-                } catch (_: Throwable) {
-                }
-                try {
                     audioRecord?.release()
                 } catch (_: Throwable) {
                 }
             }
+
+            // Never invoke callbacks if the recording session was cancelled or superseded
+            if (isCancelled || activeSessionId.get() != sessionIdToken) {
+                return@launch
+            }
+            coroutineContext.ensureActive()
 
             if (errorMessage != null) {
                 onError(errorMessage)
@@ -241,7 +281,8 @@ class LockScreenAudioRecorder(
             }
 
             val rawPcm = recordedPcmBytes
-            if (rawPcm == null || rawPcm.size < 3600 || maxPeakObserved < 75) {
+            val hasSoftVoiceSignal = speechStarted || maxPeakObserved >= 115 || maxRmsObserved >= 28.0
+            if (!hasSoftVoiceSignal || rawPcm == null || rawPcm.size < 3200 || maxPeakObserved < 65) {
                 onError(
                     if (isEnglish) {
                         "No voice detected. Speak right after pressing the button."
@@ -252,18 +293,32 @@ class LockScreenAudioRecorder(
                 return@launch
             }
 
-            // Trim trailing silence (keep up to 200ms = 6400 bytes after the last detected voice frame)
-            // so we don't upload 1+ second of dead silence over the network.
-            val trimmedPcm = if (lastVoiceBytePosition > 4800) {
-                val keepBytes = min(rawPcm.size, ((lastVoiceBytePosition + 6400) / 2) * 2)
-                if (keepBytes < rawPcm.size) rawPcm.copyOf(keepBytes) else rawPcm
+            // Trim leading silence (keep up to ~250ms = 8000 bytes pre-roll before voice onset)
+            // and trailing silence (keep up to ~280ms = 9000 bytes after last voice frame),
+            // aligned to 2-byte 16-bit PCM sample boundaries.
+            val startByte = if (speechStarted && firstVoiceBytePosition > 8000) {
+                ((firstVoiceBytePosition - 8000) / 2) * 2
+            } else {
+                0
+            }
+            val endByte = if (speechStarted && lastVoiceBytePosition > startByte + 3200) {
+                min(rawPcm.size, ((lastVoiceBytePosition + 9000) / 2) * 2)
+            } else {
+                rawPcm.size
+            }
+
+            val trimmedPcm = if (startByte > 0 || endByte < rawPcm.size) {
+                rawPcm.copyOfRange(startByte, endByte)
             } else {
                 rawPcm
             }
 
             val normalizedPcm = normalizePcm16Bit(trimmedPcm, maxPeakObserved)
             val wavBytes = encodePcmToWav(normalizedPcm, sampleRate, 1, 16)
-            onRecordingComplete(wavBytes)
+
+            if (!isCancelled && activeSessionId.get() == sessionIdToken && isActive) {
+                onRecordingComplete(wavBytes)
+            }
         }
     }
 
@@ -274,10 +329,12 @@ class LockScreenAudioRecorder(
         audioFormat: Int,
         bufferSizeInBytes: Int
     ): AudioRecord? {
+        // MIC first for full omnidirectional sensitivity when looking at the rear Glyph Matrix
         val sources = listOf(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.MIC,
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.DEFAULT
         )
         for (source in sources) {
             try {
@@ -300,9 +357,10 @@ class LockScreenAudioRecorder(
 
     private fun normalizePcm16Bit(pcmBytes: ByteArray, observedPeak: Int): ByteArray {
         val peak = max(observedPeak, 1)
-        if (peak >= 18_000) return pcmBytes
+        if (peak >= 20_000) return pcmBytes
 
-        val gain = (22_000.0 / peak.toDouble()).coerceIn(1.0, 7.5)
+        // Boost quiet/off-axis speech up to 16x so Whisper and Gemini Audio receive a clear signal
+        val gain = (24_000.0 / peak.toDouble()).coerceIn(1.0, 16.0)
         if (gain <= 1.05) return pcmBytes
 
         val out = ByteArray(pcmBytes.size)
@@ -323,7 +381,9 @@ class LockScreenAudioRecorder(
     }
 
     fun stopCancel() {
+        isCancelled = true
         shouldStopEarly = true
+        activeSessionId.incrementAndGet()
         recordingJob?.cancel()
         recordingJob = null
     }

@@ -3,23 +3,43 @@ package com.example.network
 import android.util.Base64
 import com.example.data.AiProvider
 import com.example.data.OracleSettings
+import com.example.data.SttProvider
+import com.example.data.isActiveSupportedTextModel
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 
 data class AiOracleResult(
     val question: String,
@@ -43,10 +63,127 @@ object AiOracleClient {
         OkHttpClient.Builder()
             .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES))
             .retryOnConnectionFailure(true)
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
-            .writeTimeout(20, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(18, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
             .build()
+    }
+
+    private suspend fun OkHttpClient.executeCancellable(request: Request): Response =
+        suspendCancellableCoroutine { cont ->
+            val call = newCall(request)
+            cont.invokeOnCancellation {
+                call.cancel()
+            }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) {
+                        cont.resumeWithException(e)
+                    }
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    if (cont.isActive) {
+                        cont.resume(response)
+                    } else {
+                        response.close()
+                    }
+                }
+            })
+        }
+
+    private suspend fun executeWithTransientRetry(request: Request): Pair<Int, String> {
+        var attempt = 0
+        while (true) {
+            coroutineContext.ensureActive()
+            try {
+                val (code, body) = okHttpClient.executeCancellable(request).use { resp ->
+                    resp.code to resp.body?.string().orEmpty()
+                }
+                val isTransientStatus = code == 429 || code == 502 || code == 503 || code == 504
+                if (isTransientStatus && attempt == 0) {
+                    attempt++
+                    delay(450L)
+                    continue
+                }
+                return code to body
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: IOException) {
+                if (attempt == 0 && e !is UnknownHostException) {
+                    attempt++
+                    delay(350L)
+                    continue
+                }
+                throw e
+            }
+        }
+    }
+
+    internal fun isModelNotFoundError(code: Int, errorBody: String): Boolean {
+        if (code == 404) return true
+        val lower = errorBody.lowercase()
+        return (code == 400 || code == 410) && (
+            lower.contains("not found") ||
+                lower.contains("does not exist") ||
+                lower.contains("decommissioned") ||
+                lower.contains("deprecated") ||
+                lower.contains("model_not_found")
+            )
+    }
+
+    private fun formatHttpError(
+        providerName: String,
+        model: String?,
+        code: Int,
+        body: String,
+        isEnglish: Boolean
+    ): String {
+        val detail = extractApiErrorMessage(body)
+        val modelTag = if (!model.isNullOrBlank()) " ($model)" else ""
+        return when {
+            code == 401 || code == 403 -> {
+                if (isEnglish) {
+                    "Invalid API key for $providerName (HTTP $code)"
+                } else {
+                    "Неверный API-ключ для $providerName (HTTP $code)"
+                }
+            }
+            isModelNotFoundError(code, body) -> {
+                if (isEnglish) {
+                    "Model$modelTag is deprecated or not found on $providerName (HTTP $code)"
+                } else {
+                    "Модель$modelTag снята с поддержки или не найдена у $providerName (HTTP $code)"
+                }
+            }
+            code == 429 -> {
+                if (isEnglish) {
+                    "$providerName rate limit or quota exceeded (HTTP 429)"
+                } else {
+                    "Превышен лимит запросов или квота $providerName (HTTP 429)"
+                }
+            }
+            detail.isNotBlank() -> "$providerName HTTP $code$modelTag: $detail"
+            else -> "$providerName HTTP $code$modelTag"
+        }
+    }
+
+    private fun mapNetworkException(e: Throwable, isEnglish: Boolean): Throwable {
+        if (e is CancellationException) throw e
+        return when (e) {
+            is UnknownHostException, is ConnectException -> IllegalStateException(
+                if (isEnglish) "No internet connection or server unreachable"
+                else "Нет подключения к интернету или сервер недоступен",
+                e
+            )
+            is SocketTimeoutException -> IllegalStateException(
+                if (isEnglish) "Server response timed out (20s)"
+                else "Превышено время ожидания ответа от сервера (20 с)",
+                e
+            )
+            else -> e
+        }
     }
 
     /**
@@ -57,26 +194,32 @@ object AiOracleClient {
         try {
             val provider = settings.selectedProvider
             val key = settings.getResolvedApiKey(provider)
+            if (key.isBlank() && provider != AiProvider.OPENROUTER) return@withContext
             val baseUrl = settings.getBaseUrl(provider)
             val pingUrl = when (provider) {
-                AiProvider.GEMINI -> "$baseUrl/models?pageSize=1&key=$key"
+                AiProvider.GEMINI -> "$baseUrl/models?pageSize=1"
                 else -> "$baseUrl/models"
             }
             val reqBuilder = Request.Builder()
                 .url(pingUrl)
                 .head()
-            if (provider != AiProvider.GEMINI && key.isNotBlank()) {
+            if (provider == AiProvider.GEMINI) {
+                reqBuilder.header("x-goog-api-key", key)
+            } else if (key.isNotBlank()) {
                 reqBuilder.header("Authorization", "Bearer $key")
             }
-            okHttpClient.newCall(reqBuilder.build()).execute().close()
+            okHttpClient.executeCancellable(reqBuilder.build()).close()
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Throwable) {
             // Best-effort socket pre-warm
         }
     }
 
     /**
-     * Fetches the list of available models from the selected AI provider's API
+     * Fetches the list of available chat/text models from the selected AI provider's API
      * (`GET {baseUrl}/models` for OpenAI-compatible providers, `/v1beta/models` for Gemini).
+     * Note: OpenRouter's `/api/v1/models` endpoint is public and can be fetched even without a key.
      */
     suspend fun fetchAvailableModels(
         provider: AiProvider,
@@ -85,7 +228,7 @@ object AiOracleClient {
         isEnglish: Boolean = false
     ): Result<List<String>> = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
-        if (cleanKey.isEmpty()) {
+        if (cleanKey.isEmpty() && provider != AiProvider.OPENROUTER) {
             return@withContext Result.failure(
                 IllegalStateException(
                     if (isEnglish) "Enter an API key for ${provider.displayName} first"
@@ -100,50 +243,66 @@ object AiOracleClient {
             val models = when (provider) {
                 AiProvider.GEMINI -> {
                     val req = Request.Builder()
-                        .url("$cleanBase/models?key=$cleanKey")
+                        .url("$cleanBase/models?pageSize=100")
+                        .header("x-goog-api-key", cleanKey)
                         .header("Accept", "application/json")
                         .get()
                         .build()
-                    okHttpClient.newCall(req).execute().use { resp ->
-                        val body = resp.body?.string().orEmpty()
-                        if (!resp.isSuccessful) {
-                            throw IllegalStateException("Gemini HTTP ${resp.code}: ${extractApiErrorMessage(body)}")
-                        }
-                        val arr = json.parseToJsonElement(body).jsonObject["models"]?.jsonArray
-                        arr?.mapNotNull { el ->
-                            el.jsonObject["name"]?.jsonPrimitive?.content?.removePrefix("models/")
-                        }?.filter { it.startsWith("gemini") } ?: emptyList()
+                    val (code, body) = executeWithTransientRetry(req)
+                    if (code !in 200..299) {
+                        throw IllegalStateException(
+                            formatHttpError(provider.displayName, null, code, body, isEnglish)
+                        )
                     }
+                    val arr = json.parseToJsonElement(body).jsonObject["models"]?.jsonArray
+                    val rawGeminiModels = arr?.mapNotNull { el ->
+                        val obj = el.jsonObject
+                        val name = obj["name"]?.jsonPrimitive?.content?.removePrefix("models/")
+                            ?: return@mapNotNull null
+                        val methods = obj["supportedGenerationMethods"]?.jsonArray
+                            ?.mapNotNull { m -> m.jsonPrimitive.content }
+                        val supportsGenerate = methods == null || methods.contains("generateContent")
+                        if (supportsGenerate) name else null
+                    }?.filter { id ->
+                        isActiveSupportedTextModel(id, AiProvider.GEMINI)
+                    } ?: emptyList()
+
+                    val withAliases = (
+                        listOf("gemini-flash-latest", "gemini-flash-lite-latest") + rawGeminiModels
+                        ).distinct()
+                    prioritizeModels(withAliases, provider.presetModels)
                 }
 
                 else -> {
-                    val req = Request.Builder()
+                    val reqBuilder = Request.Builder()
                         .url("$cleanBase/models")
-                        .header("Authorization", "Bearer $cleanKey")
                         .header("Accept", "application/json")
                         .get()
-                        .build()
-                    okHttpClient.newCall(req).execute().use { resp ->
-                        val body = resp.body?.string().orEmpty()
-                        if (!resp.isSuccessful) {
-                            throw IllegalStateException("${provider.displayName} HTTP ${resp.code}: ${extractApiErrorMessage(body)}")
-                        }
-                        val arr = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray
-                        val list = arr?.mapNotNull { el ->
-                            el.jsonObject["id"]?.jsonPrimitive?.content
-                        }?.filter { id ->
-                            !id.contains("whisper", ignoreCase = true) &&
-                                !id.contains("guard", ignoreCase = true) &&
-                                !id.contains("tts", ignoreCase = true) &&
-                                !id.contains("embedding", ignoreCase = true) &&
-                                !id.contains("moderation", ignoreCase = true) &&
-                                !id.contains("dall-e", ignoreCase = true)
-                        } ?: emptyList()
+                    if (cleanKey.isNotBlank()) {
+                        reqBuilder.header("Authorization", "Bearer $cleanKey")
+                    }
+                    val (code, body) = executeWithTransientRetry(reqBuilder.build())
+                    if (code !in 200..299) {
+                        throw IllegalStateException(
+                            formatHttpError(provider.displayName, null, code, body, isEnglish)
+                        )
+                    }
+                    val arr = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray
+                    val filtered = arr?.mapNotNull { el ->
+                        el.jsonObject["id"]?.jsonPrimitive?.content
+                    }?.filter { id ->
+                        isActiveSupportedTextModel(id, provider)
+                    } ?: emptyList()
 
-                        if (provider == AiProvider.OPENROUTER) list.take(45) else list.sorted()
+                    val prioritized = prioritizeModels(filtered, provider.presetModels)
+                    if (provider == AiProvider.OPENROUTER) {
+                        prioritized.take(60)
+                    } else {
+                        prioritized
                     }
                 }
             }
+
             if (models.isEmpty()) {
                 Result.failure(
                     IllegalStateException(
@@ -154,15 +313,60 @@ object AiOracleClient {
             } else {
                 Result.success(models)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            Result.failure(e)
+            Result.failure(mapNetworkException(e, isEnglish))
         }
+    }
+
+    private fun prioritizeModels(fetched: List<String>, preferredOrder: List<String>): List<String> {
+        val distinctFetched = fetched.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val preferredMap = preferredOrder.withIndex().associate { (idx, name) -> name.lowercase() to idx }
+        val (knownPreferred, others) = distinctFetched.partition { preferredMap.containsKey(it.lowercase()) }
+        val sortedPreferred = knownPreferred.sortedBy { preferredMap[it.lowercase()] ?: Int.MAX_VALUE }
+        val sortedOthers = others.sorted()
+        return (sortedPreferred + sortedOthers).distinct()
+    }
+
+    /**
+     * Parses a two-line `Q: ...` / `A: ...` response from single-trip Gemini Audio.
+     * Returns null if either question or answer is missing or if the response was truncated
+     * after `Q:` (preventing `Q:` from ever being mistaken for `A:`).
+     */
+    internal fun parseSingleTripQa(rawText: String): Pair<String, String>? {
+        val lines = rawText.lines()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+
+        val qPrefixRegex = Regex("^(?:Q|Question|Вопрос)\\s*:\\s*", RegexOption.IGNORE_CASE)
+        val aPrefixRegex = Regex("^(?:A|Answer|Ответ)\\s*:\\s*", RegexOption.IGNORE_CASE)
+
+        val qLineRaw = lines.firstOrNull { qPrefixRegex.containsMatchIn(it) }
+        val aLineRaw = lines.firstOrNull { aPrefixRegex.containsMatchIn(it) }
+
+        val question = qLineRaw?.replaceFirst(qPrefixRegex, "")?.trim()
+        val explicitAnswer = aLineRaw?.replaceFirst(aPrefixRegex, "")?.trim()
+
+        if (!question.isNullOrBlank() && !explicitAnswer.isNullOrBlank()) {
+            return question to explicitAnswer
+        }
+
+        // If Q: was found but A: was not labeled, ONLY accept a subsequent line that is not Q:
+        if (!question.isNullOrBlank() && lines.size >= 2) {
+            val candidateAnswerLine = lines.last()
+            if (candidateAnswerLine != qLineRaw && !qPrefixRegex.containsMatchIn(candidateAnswerLine)) {
+                return question to candidateAnswerLine
+            }
+        }
+
+        return null
     }
 
     /**
      * Fast-path single-round-trip Audio -> Oracle Answer for Gemini when Gemini is the active provider
-     * and no separate Groq Whisper key is configured. Sends the WAV audio and system prompt in ONE
-     * HTTP request instead of two sequential requests, cutting latency in half!
+     * and STT is set to AUTO (with no separate Groq key) or GEMINI_AUDIO.
      */
     suspend fun processAudioAndAskOracle(
         wavBytes: ByteArray,
@@ -172,13 +376,19 @@ object AiOracleClient {
         val groqKey = settings.getResolvedApiKey(AiProvider.GROQ)
         val geminiKey = settings.getResolvedApiKey(AiProvider.GEMINI)
 
-        // Single-round-trip optimization when Gemini is the selected provider and Groq Whisper isn't overriding
-        if (settings.selectedProvider == AiProvider.GEMINI && geminiKey.isNotBlank() && groqKey.isBlank()) {
+        val allowGeminiSingleTrip = settings.selectedProvider == AiProvider.GEMINI &&
+            geminiKey.isNotBlank() &&
+            (settings.sttProvider == SttProvider.GEMINI_AUDIO ||
+                (settings.sttProvider == SttProvider.AUTO && groqKey.isBlank()))
+
+        if (allowGeminiSingleTrip) {
             try {
                 val singleTrip = askGeminiAudioSingleTrip(wavBytes, geminiKey, settings, totalStart)
                 if (singleTrip != null) {
                     return@withContext Result.success(singleTrip)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 // Fall back to 2-step transcribe + askOracle below
             }
@@ -201,41 +411,47 @@ object AiOracleClient {
         askOracle(recognizedQuestion, settings)
     }
 
-    private fun askGeminiAudioSingleTrip(
+    private suspend fun askGeminiAudioSingleTrip(
         wavBytes: ByteArray,
         geminiKey: String,
         settings: OracleSettings,
         startTimeMs: Long
     ): AiOracleResult? {
+        val userModel = settings.getActiveModel(AiProvider.GEMINI)
+            .removePrefix("models/")
+            .trim()
+            .ifBlank { AiProvider.GEMINI.defaultModel }
+
+        if (userModel.startsWith("gemma", ignoreCase = true)) {
+            return null
+        }
+
         val base64Audio = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
-        val userModel = settings.getActiveModel(AiProvider.GEMINI).removePrefix("models/").trim()
-        val candidates = linkedSetOf(
-            userModel.ifBlank { "gemini-2.5-flash" },
-            "gemini-2.5-flash",
-            "gemini-flash-latest"
-        )
+        val effectivePrompt = settings.getEffectiveSystemPrompt()
 
         val promptText = if (settings.isEnglish) {
-            "${settings.systemPrompt.trim()}\n" +
+            "$effectivePrompt\n" +
                 "Listen to the user's spoken question in this audio. " +
                 "Output strictly in 2 lines:\n" +
                 "Q: <transcribed question>\n" +
-                "A: <ultra-short answer, max ${settings.maxWordsLimit} words>"
+                "A: <answer following the instructions above>"
         } else {
-            "${settings.systemPrompt.trim()}\n" +
+            "$effectivePrompt\n" +
                 "Прослушай голосовой вопрос пользователя в этом аудио. " +
                 "Выведи ответ строго в 2 строки:\n" +
                 "Q: <распознанный текст вопроса>\n" +
-                "A: <ультра-краткий ответ максимум из ${settings.maxWordsLimit} слов>"
+                "A: <ответ согласно инструкции выше>"
         }
 
-        for (model in candidates) {
+        val url = "${settings.getBaseUrl(AiProvider.GEMINI)}/models/$userModel:generateContent"
+        for (includeThinkingConfig in listOf(true, false)) {
+            coroutineContext.ensureActive()
             try {
-                val url = "${settings.getBaseUrl(AiProvider.GEMINI)}/models/$model:generateContent?key=${geminiKey.trim()}"
                 val payload = buildJsonObject {
                     putJsonArray("contents") {
                         add(
                             buildJsonObject {
+                                put("role", "user")
                                 putJsonArray("parts") {
                                     add(buildJsonObject { put("text", promptText) })
                                     add(
@@ -250,54 +466,47 @@ object AiOracleClient {
                             }
                         )
                     }
-                    putJsonObject("generationConfig") {
-                        put("temperature", 0.1)
-                        put("maxOutputTokens", 50)
-                    }
+                    putGeminiGenerationConfig(
+                        model = userModel,
+                        baseMaxTokens = 300,
+                        temperature = 0.1,
+                        includeThinkingConfig = includeThinkingConfig
+                    )
                 }.toString()
 
                 val request = Request.Builder()
                     .url(url)
+                    .header("x-goog-api-key", geminiKey.trim())
                     .post(payload.toByteArray(Charsets.UTF_8).toRequestBody(jsonMediaType))
                     .build()
 
-                okHttpClient.newCall(request).execute().use { response ->
-                    val bodyString = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) continue
-                    val root = json.parseToJsonElement(bodyString).jsonObject
-                    val rawText = root["candidates"]?.jsonArray
-                        ?.firstOrNull()?.jsonObject
-                        ?.get("content")?.jsonObject
-                        ?.get("parts")?.jsonArray
-                        ?.firstOrNull()?.jsonObject
-                        ?.get("text")?.jsonPrimitive?.content
-                        ?.trim()
-                        .orEmpty()
-
-                    if (rawText.isNotBlank()) {
-                        val lines = rawText.lines().map { it.trim() }.filter { it.isNotBlank() }
-                        val qLine = lines.firstOrNull { it.startsWith("Q:", ignoreCase = true) }
-                            ?.substringAfter(":")?.trim()
-                        val aLine = lines.firstOrNull { it.startsWith("A:", ignoreCase = true) }
-                            ?.substringAfter(":")?.trim()
-                            ?: lines.lastOrNull()
-
-                        if (!qLine.isNullOrBlank() && !aLine.isNullOrBlank()) {
-                            val cleanQ = filterSttHallucinations(qLine)
-                            if (cleanQ.isBlank()) return null
-                            val cleanA = sanitizeUltraShortAnswer(aLine, settings.maxWordsLimit)
-                            val latency = (System.currentTimeMillis() - startTimeMs).coerceAtLeast(1L)
-                            return AiOracleResult(
-                                question = cleanQ,
-                                answer = cleanA,
-                                rawAnswer = aLine,
-                                provider = AiProvider.GEMINI,
-                                model = model,
-                                latencyMs = latency
-                            )
-                        }
+                val (code, bodyString) = executeWithTransientRetry(request)
+                if (code !in 200..299) {
+                    if (code == 400 && includeThinkingConfig) {
+                        continue
                     }
+                    return null
                 }
+                val root = json.parseToJsonElement(bodyString).jsonObject
+                val rawText = extractGeminiResponseText(root)
+                val qa = parseSingleTripQa(rawText) ?: if (includeThinkingConfig) continue else return null
+
+                val cleanQ = filterSttHallucinations(qa.first)
+                if (cleanQ.isBlank()) return null
+                val cleanA = sanitizeUltraShortAnswer(qa.second, settings.maxWordsLimit, settings.isEnglish)
+                if (cleanA.isBlank() || cleanA == "?") return null
+
+                val latency = (System.currentTimeMillis() - startTimeMs).coerceAtLeast(1L)
+                return AiOracleResult(
+                    question = cleanQ,
+                    answer = cleanA,
+                    rawAnswer = qa.second,
+                    provider = AiProvider.GEMINI,
+                    model = userModel,
+                    latencyMs = latency
+                )
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
             }
         }
@@ -306,8 +515,7 @@ object AiOracleClient {
 
     /**
      * Transcribes 16kHz mono WAV audio recorded by `LockScreenAudioRecorder`.
-     * Supports Groq Whisper (`whisper-large-v3-turbo`), OpenAI Whisper (`whisper-1`),
-     * Gemini Audio, OpenRouter Audio, and Custom OpenAI-compatible `/audio/transcriptions`.
+     * Respects `settings.sttProvider` and `settings.getWhisperLanguageIso()` (including auto-detection).
      */
     suspend fun transcribeAudioWav(
         wavBytes: ByteArray,
@@ -318,88 +526,169 @@ object AiOracleClient {
         val geminiKey = settings.getResolvedApiKey(AiProvider.GEMINI)
         val openRouterKey = settings.getResolvedApiKey(AiProvider.OPENROUTER)
         val customKey = settings.getResolvedApiKey(AiProvider.CUSTOM_OPENAI)
-        val langIso = if (settings.isEnglish) "en" else "ru"
+        val langIso = settings.getWhisperLanguageIso()
+        val isEn = settings.isEnglish
+
+        val providerOrder: List<AiProvider> = when (settings.sttProvider) {
+            SttProvider.GROQ_WHISPER -> listOf(AiProvider.GROQ)
+            SttProvider.GEMINI_AUDIO -> listOf(AiProvider.GEMINI)
+            SttProvider.OPENAI_WHISPER -> listOf(AiProvider.OPENAI)
+            SttProvider.OPENROUTER_AUDIO -> listOf(AiProvider.OPENROUTER)
+            SttProvider.CUSTOM_WHISPER -> listOf(AiProvider.CUSTOM_OPENAI)
+            SttProvider.AUTO -> linkedSetOf<AiProvider>().apply {
+                if (settings.selectedProvider != AiProvider.DEEPSEEK) {
+                    add(settings.selectedProvider)
+                }
+                if (groqKey.isNotBlank()) add(AiProvider.GROQ)
+                if (geminiKey.isNotBlank()) add(AiProvider.GEMINI)
+                if (openAiKey.isNotBlank()) add(AiProvider.OPENAI)
+                if (openRouterKey.isNotBlank()) add(AiProvider.OPENROUTER)
+                if (customKey.isNotBlank()) add(AiProvider.CUSTOM_OPENAI)
+            }.toList()
+        }
 
         val errors = mutableListOf<String>()
 
-        val providerOrder = linkedSetOf<AiProvider>().apply {
-            if (groqKey.isNotBlank()) add(AiProvider.GROQ)
-            add(settings.selectedProvider)
-            add(AiProvider.OPENAI)
-            add(AiProvider.GEMINI)
-            add(AiProvider.OPENROUTER)
-            add(AiProvider.CUSTOM_OPENAI)
-            add(AiProvider.GROQ)
-        }
-
         for (provider in providerOrder) {
+            coroutineContext.ensureActive()
             when (provider) {
-                AiProvider.GROQ -> if (groqKey.isNotBlank()) {
+                AiProvider.GROQ -> {
+                    if (groqKey.isBlank()) {
+                        if (settings.sttProvider == SttProvider.GROQ_WHISPER) {
+                            return@withContext Result.failure(
+                                IllegalStateException(
+                                    if (isEn) "Enter a Groq API key in Settings for Groq Whisper STT"
+                                    else "Укажите API-ключ Groq в настройках для распознавания через Groq Whisper"
+                                )
+                            )
+                        }
+                        continue
+                    }
                     try {
                         val transcript = transcribeViaOpenAiWhisperEndpoint(
+                            providerName = "Groq STT",
                             wavBytes = wavBytes,
                             endpointUrl = "https://api.groq.com/openai/v1/audio/transcriptions",
                             apiKey = groqKey,
                             models = listOf("whisper-large-v3-turbo", "whisper-large-v3"),
-                            langIso = langIso
+                            langIso = langIso,
+                            isEnglish = isEn
                         )
                         if (transcript.isNotBlank()) return@withContext Result.success(transcript)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        errors.add("Groq STT: ${e.message}")
+                        errors.add(e.message ?: "Groq STT error")
                     }
                 }
 
-                AiProvider.OPENAI -> if (openAiKey.isNotBlank()) {
+                AiProvider.OPENAI -> {
+                    if (openAiKey.isBlank()) {
+                        if (settings.sttProvider == SttProvider.OPENAI_WHISPER) {
+                            return@withContext Result.failure(
+                                IllegalStateException(
+                                    if (isEn) "Enter an OpenAI API key in Settings for OpenAI Whisper STT"
+                                    else "Укажите API-ключ OpenAI в настройках для распознавания через OpenAI Whisper"
+                                )
+                            )
+                        }
+                        continue
+                    }
                     try {
                         val transcript = transcribeViaOpenAiWhisperEndpoint(
+                            providerName = "OpenAI STT",
                             wavBytes = wavBytes,
                             endpointUrl = "https://api.openai.com/v1/audio/transcriptions",
                             apiKey = openAiKey,
                             models = listOf("gpt-4o-mini-transcribe", "whisper-1"),
-                            langIso = langIso
+                            langIso = langIso,
+                            isEnglish = isEn
                         )
                         if (transcript.isNotBlank()) return@withContext Result.success(transcript)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        errors.add("OpenAI STT: ${e.message}")
+                        errors.add(e.message ?: "OpenAI STT error")
                     }
                 }
 
-                AiProvider.GEMINI -> if (geminiKey.isNotBlank()) {
+                AiProvider.GEMINI -> {
+                    if (geminiKey.isBlank()) {
+                        if (settings.sttProvider == SttProvider.GEMINI_AUDIO) {
+                            return@withContext Result.failure(
+                                IllegalStateException(
+                                    if (isEn) "Enter a Gemini API key in Settings for Gemini Audio STT"
+                                    else "Укажите API-ключ Gemini в настройках для распознавания речи"
+                                )
+                            )
+                        }
+                        continue
+                    }
                     try {
                         val transcript = transcribeViaGeminiAudio(wavBytes, geminiKey, settings)
                         if (transcript.isNotBlank()) return@withContext Result.success(transcript)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        errors.add("Gemini STT: ${e.message}")
+                        errors.add(e.message ?: "Gemini STT error")
                     }
                 }
 
-                AiProvider.OPENROUTER -> if (openRouterKey.isNotBlank()) {
+                AiProvider.OPENROUTER -> {
+                    if (openRouterKey.isBlank()) {
+                        if (settings.sttProvider == SttProvider.OPENROUTER_AUDIO) {
+                            return@withContext Result.failure(
+                                IllegalStateException(
+                                    if (isEn) "Enter an OpenRouter API key in Settings for OpenRouter Audio STT"
+                                    else "Укажите API-ключ OpenRouter в настройках для распознавания речи"
+                                )
+                            )
+                        }
+                        continue
+                    }
                     try {
-                        val transcript = transcribeViaOpenRouterAudio(wavBytes, openRouterKey)
+                        val transcript = transcribeViaOpenRouterAudio(wavBytes, openRouterKey, isEn)
                         if (transcript.isNotBlank()) return@withContext Result.success(transcript)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        errors.add("OpenRouter STT: ${e.message}")
+                        errors.add(e.message ?: "OpenRouter STT error")
                     }
                 }
 
-                AiProvider.CUSTOM_OPENAI -> if (customKey.isNotBlank()) {
+                AiProvider.CUSTOM_OPENAI -> {
+                    if (customKey.isBlank()) {
+                        if (settings.sttProvider == SttProvider.CUSTOM_WHISPER) {
+                            return@withContext Result.failure(
+                                IllegalStateException(
+                                    if (isEn) "Enter an API key for Custom OpenAI-Compatible STT"
+                                    else "Укажите API-ключ для совместимого сервера STT"
+                                )
+                            )
+                        }
+                        continue
+                    }
                     try {
                         val base = settings.getBaseUrl(AiProvider.CUSTOM_OPENAI)
                         val transcript = transcribeViaOpenAiWhisperEndpoint(
+                            providerName = "Custom STT",
                             wavBytes = wavBytes,
                             endpointUrl = "$base/audio/transcriptions",
                             apiKey = customKey,
                             models = listOf("whisper-large-v3-turbo", "whisper-1"),
-                            langIso = langIso
+                            langIso = langIso,
+                            isEnglish = isEn
                         )
                         if (transcript.isNotBlank()) return@withContext Result.success(transcript)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        errors.add("Custom STT: ${e.message}")
+                        errors.add(e.message ?: "Custom STT error")
                     }
                 }
 
                 AiProvider.DEEPSEEK -> {
-                    // DeepSeek does not host an audio/transcriptions endpoint; handled by fallback providers
+                    // DeepSeek does not expose an audio/transcriptions endpoint
                 }
             }
         }
@@ -407,27 +696,30 @@ object AiOracleClient {
         val errSummary = if (errors.isNotEmpty()) {
             errors.joinToString("; ")
         } else {
-            if (settings.isEnglish) {
-                "Enter an API key in the 'AI & PROMPT' tab first (Groq / Gemini / OpenAI / OpenRouter)"
+            if (isEn) {
+                "Configure an API key for speech recognition (Groq / Gemini / OpenAI / OpenRouter) in Settings"
             } else {
-                "Укажите API-ключ на вкладке 'AI & ПРОМПТ' (Groq / Gemini / OpenAI / OpenRouter)"
+                "Для распознавания голоса укажите API-ключ (Groq / Gemini / OpenAI / OpenRouter) в настройках"
             }
         }
         Result.failure(IllegalStateException(errSummary))
     }
 
-    private fun transcribeViaOpenAiWhisperEndpoint(
+    private suspend fun transcribeViaOpenAiWhisperEndpoint(
+        providerName: String,
         wavBytes: ByteArray,
         endpointUrl: String,
         apiKey: String,
         models: List<String>,
-        langIso: String
+        langIso: String?,
+        isEnglish: Boolean
     ): String {
         var lastError: Exception? = null
 
         for (whisperModel in models) {
+            coroutineContext.ensureActive()
             try {
-                val multipartBody = MultipartBody.Builder()
+                val multipartBuilder = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart(
                         "file",
@@ -435,36 +727,46 @@ object AiOracleClient {
                         wavBytes.toRequestBody(wavMediaType)
                     )
                     .addFormDataPart("model", whisperModel)
-                    .addFormDataPart("language", langIso)
                     .addFormDataPart("temperature", "0")
                     .addFormDataPart("response_format", "json")
-                    .build()
+
+                if (!langIso.isNullOrBlank()) {
+                    multipartBuilder.addFormDataPart("language", langIso)
+                }
 
                 val request = Request.Builder()
                     .url(endpointUrl)
                     .header("Authorization", "Bearer ${apiKey.trim()}")
-                    .post(multipartBody)
+                    .post(multipartBuilder.build())
                     .build()
 
-                okHttpClient.newCall(request).execute().use { response ->
-                    val bodyString = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) {
-                        throw IllegalStateException("HTTP ${response.code}: ${extractApiErrorMessage(bodyString)}")
+                val (code, bodyString) = executeWithTransientRetry(request)
+                if (code !in 200..299) {
+                    val err = IllegalStateException(
+                        formatHttpError(providerName, whisperModel, code, bodyString, isEnglish)
+                    )
+                    if (isModelNotFoundError(code, bodyString)) {
+                        lastError = err
+                        continue
                     }
-                    val obj = json.parseToJsonElement(bodyString).jsonObject
-                    val rawText = obj["text"]?.jsonPrimitive?.content?.trim().orEmpty()
-                    val cleaned = filterSttHallucinations(rawText)
-                    if (cleaned.isNotBlank()) return cleaned
+                    throw err
                 }
+                val obj = json.parseToJsonElement(bodyString).jsonObject
+                val rawText = obj["text"]?.jsonPrimitive?.content?.trim().orEmpty()
+                val cleaned = filterSttHallucinations(rawText)
+                if (cleaned.isNotBlank()) return cleaned
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 lastError = e
+                break
             }
         }
-        if (lastError != null) throw lastError
+        if (lastError != null) throw mapNetworkException(lastError, isEnglish)
         return ""
     }
 
-    private fun transcribeViaGeminiAudio(
+    private suspend fun transcribeViaGeminiAudio(
         wavBytes: ByteArray,
         geminiKey: String,
         settings: OracleSettings
@@ -473,17 +775,19 @@ object AiOracleClient {
         val userModel = settings.getActiveModel(AiProvider.GEMINI)
             .removePrefix("models/")
             .trim()
-        val candidateModels = linkedSetOf(
-            userModel.ifBlank { "gemini-2.5-flash" },
-            "gemini-2.5-flash",
-            "gemini-flash-latest",
-            "gemini-2.0-flash"
-        )
+        val candidateModels = linkedSetOf<String>().apply {
+            if (userModel.isNotBlank() && !userModel.startsWith("gemma", ignoreCase = true)) {
+                add(userModel)
+            }
+            add("gemini-flash-latest")
+            add("gemini-2.5-flash")
+        }
 
         var lastError: Exception? = null
         for (model in candidateModels) {
+            coroutineContext.ensureActive()
             try {
-                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=${geminiKey.trim()}"
+                val url = "${settings.getBaseUrl(AiProvider.GEMINI)}/models/$model:generateContent"
 
                 val payload = buildJsonObject {
                     putJsonArray("contents") {
@@ -510,49 +814,50 @@ object AiOracleClient {
                             }
                         )
                     }
-                    putJsonObject("generationConfig") {
-                        put("temperature", 0.0)
-                        put("maxOutputTokens", 35)
-                    }
+                    putGeminiGenerationConfig(
+                        model = model,
+                        baseMaxTokens = 256,
+                        temperature = 0.0,
+                        includeThinkingConfig = true
+                    )
                 }.toString()
 
                 val request = Request.Builder()
                     .url(url)
+                    .header("x-goog-api-key", geminiKey.trim())
                     .post(payload.toByteArray(Charsets.UTF_8).toRequestBody(jsonMediaType))
                     .build()
 
-                okHttpClient.newCall(request).execute().use { response ->
-                    val bodyString = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) {
-                        throw IllegalStateException("HTTP ${response.code} ($model): ${extractApiErrorMessage(bodyString)}")
+                val (code, bodyString) = executeWithTransientRetry(request)
+                if (code !in 200..299) {
+                    val err = IllegalStateException(
+                        formatHttpError("Gemini STT", model, code, bodyString, settings.isEnglish)
+                    )
+                    if (isModelNotFoundError(code, bodyString)) {
+                        lastError = err
+                        continue
                     }
-                    val root = json.parseToJsonElement(bodyString).jsonObject
-                    val rawText = root["candidates"]?.jsonArray
-                        ?.firstOrNull()?.jsonObject
-                        ?.get("content")?.jsonObject
-                        ?.get("parts")?.jsonArray
-                        ?.firstOrNull()?.jsonObject
-                        ?.get("text")?.jsonPrimitive?.content
-                        ?.trim()
-                        .orEmpty()
-                    val cleaned = filterSttHallucinations(rawText)
-                    if (cleaned.isNotBlank()) return cleaned
+                    throw err
                 }
+                val root = json.parseToJsonElement(bodyString).jsonObject
+                val rawText = extractGeminiResponseText(root).replace('\n', ' ')
+                val cleaned = filterSttHallucinations(rawText)
+                if (cleaned.isNotBlank()) return cleaned
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 lastError = e
-                val msg = e.message.orEmpty()
-                if (msg.contains("400") && msg.contains("API_KEY_INVALID", ignoreCase = true)) {
-                    throw e
-                }
+                break
             }
         }
-        if (lastError != null) throw lastError
+        if (lastError != null) throw mapNetworkException(lastError, settings.isEnglish)
         return ""
     }
 
-    private fun transcribeViaOpenRouterAudio(
+    private suspend fun transcribeViaOpenRouterAudio(
         wavBytes: ByteArray,
-        openRouterKey: String
+        openRouterKey: String,
+        isEnglish: Boolean
     ): String {
         val base64Audio = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
         val payload = buildJsonObject {
@@ -585,7 +890,7 @@ object AiOracleClient {
                 )
             }
             put("temperature", 0.0)
-            put("max_tokens", 35)
+            put("max_tokens", 200)
         }.toString()
 
         val request = Request.Builder()
@@ -595,23 +900,23 @@ object AiOracleClient {
             .post(payload.toByteArray(Charsets.UTF_8).toRequestBody(jsonMediaType))
             .build()
 
-        okHttpClient.newCall(request).execute().use { response ->
-            val bodyString = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IllegalStateException("HTTP ${response.code}: ${extractApiErrorMessage(bodyString)}")
-            }
-            val root = json.parseToJsonElement(bodyString).jsonObject
-            val rawText = root["choices"]?.jsonArray
-                ?.firstOrNull()?.jsonObject
-                ?.get("message")?.jsonObject
-                ?.get("content")?.jsonPrimitive?.content
-                ?.trim()
-                .orEmpty()
-            return filterSttHallucinations(rawText)
+        val (code, bodyString) = executeWithTransientRetry(request)
+        if (code !in 200..299) {
+            throw IllegalStateException(
+                formatHttpError("OpenRouter STT", "google/gemini-2.5-flash", code, bodyString, isEnglish)
+            )
         }
+        val root = json.parseToJsonElement(bodyString).jsonObject
+        val rawText = root["choices"]?.jsonArray
+            ?.firstOrNull()?.jsonObject
+            ?.get("message")?.jsonObject
+            ?.get("content")?.jsonPrimitive?.content
+            ?.trim()
+            .orEmpty()
+        return filterSttHallucinations(rawText)
     }
 
-    private fun filterSttHallucinations(raw: String): String {
+    internal fun filterSttHallucinations(raw: String): String {
         val trimmed = raw.trim().trim('"', '\'', '«', '»')
         if (trimmed.isEmpty()) return ""
         val lower = trimmed.lowercase()
@@ -642,43 +947,32 @@ object AiOracleClient {
         val requestedModel = settings.getActiveModel(provider)
         val apiKey = settings.getResolvedApiKey(provider)
         val baseUrl = settings.getBaseUrl(provider)
+        val isEn = settings.isEnglish
 
         if (apiKey.isBlank()) {
             return@withContext Result.failure(
                 IllegalStateException(
-                    if (settings.isEnglish) {
-                        "Missing API key for ${provider.displayName}. Enter your key in the 'AI & PROMPT' tab."
+                    if (isEn) {
+                        "Missing API key for ${provider.displayName}. Enter your key in Settings."
                     } else {
-                        "Не задан API-ключ для ${provider.displayName}. Введите свой ключ на вкладке 'AI & ПРОМПТ'."
+                        "Не задан API-ключ для ${provider.displayName}. Введите свой ключ во вкладке Настройки."
                     }
                 )
             )
         }
 
-        val fullSystemInstruction = if (settings.isEnglish) {
-            buildString {
-                append(settings.systemPrompt.trim())
-                append("\nStrict answer length limit: maximum ")
-                append(settings.maxWordsLimit)
-                append(" word(s). Output ONLY the answer in English with no quotes or trailing period.")
-            }
-        } else {
-            buildString {
-                append(settings.systemPrompt.trim())
-                append("\nЖесткий лимит длины ответа: максимум ")
-                append(settings.maxWordsLimit)
-                append(" слов(а). Выводи ТОЛЬКО сам ответ без кавычек и без точки в конце.")
-            }
-        }
+        val fullSystemInstruction = settings.getEffectiveSystemPrompt()
 
         try {
             val (rawText, usedModel) = when (provider) {
                 AiProvider.GEMINI -> {
                     callGeminiWithFallback(
+                        baseUrl = baseUrl,
                         requestedModel = requestedModel,
                         apiKey = apiKey,
                         systemInstruction = fullSystemInstruction,
-                        question = question
+                        question = question,
+                        isEnglish = isEn
                     )
                 }
 
@@ -687,7 +981,8 @@ object AiOracleClient {
                         requestedModel = requestedModel,
                         apiKey = apiKey,
                         systemInstruction = fullSystemInstruction,
-                        question = question
+                        question = question,
+                        isEnglish = isEn
                     )
                 }
 
@@ -696,18 +991,20 @@ object AiOracleClient {
                 AiProvider.DEEPSEEK,
                 AiProvider.CUSTOM_OPENAI -> {
                     callOpenCompatibleChatApi(
+                        providerName = provider.displayName,
                         url = "$baseUrl/chat/completions",
                         apiKey = apiKey,
                         model = requestedModel,
                         systemInstruction = fullSystemInstruction,
                         question = question,
-                        isOpenRouter = provider == AiProvider.OPENROUTER
+                        isOpenRouter = provider == AiProvider.OPENROUTER,
+                        isEnglish = isEn
                     ) to requestedModel
                 }
             }
 
             val latency = (System.currentTimeMillis() - startTime).coerceAtLeast(1L)
-            val sanitized = sanitizeUltraShortAnswer(rawText, settings.maxWordsLimit)
+            val sanitized = sanitizeUltraShortAnswer(rawText, settings.maxWordsLimit, isEn)
 
             Result.success(
                 AiOracleResult(
@@ -719,210 +1016,391 @@ object AiOracleClient {
                     latencyMs = latency
                 )
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            Result.failure(e)
+            Result.failure(mapNetworkException(e, isEn))
         }
     }
 
-    private fun callGroqWithFallback(
+    private suspend fun callGroqWithFallback(
         requestedModel: String,
         apiKey: String,
         systemInstruction: String,
-        question: String
+        question: String,
+        isEnglish: Boolean
     ): Pair<String, String> {
-        val candidateModels = linkedSetOf(
-            requestedModel.trim().ifBlank { "llama-3.3-70b-versatile" },
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant"
-        )
+        val activeModel = requestedModel.trim().ifBlank { AiProvider.GROQ.defaultModel }
+        val candidates = linkedSetOf(activeModel, AiProvider.GROQ.defaultModel)
+        var lastError: Exception? = null
 
-        var firstException: Exception? = null
-        for (modelCandidate in candidateModels) {
+        for (candidate in candidates) {
+            coroutineContext.ensureActive()
             try {
                 val reply = callOpenCompatibleChatApi(
+                    providerName = AiProvider.GROQ.displayName,
                     url = "https://api.groq.com/openai/v1/chat/completions",
                     apiKey = apiKey,
-                    model = modelCandidate,
+                    model = candidate,
                     systemInstruction = systemInstruction,
                     question = question,
-                    isOpenRouter = false
+                    isOpenRouter = false,
+                    isEnglish = isEnglish
                 )
-                return reply to modelCandidate
+                return reply to candidate
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: ModelNotFoundException) {
+                lastError = e
+                continue
             } catch (e: Exception) {
-                if (firstException == null) firstException = e
-                val msg = e.message.orEmpty()
-                if (msg.contains("401") || msg.contains("invalid_api_key", ignoreCase = true)) {
-                    throw e
-                }
+                throw e
             }
         }
-        throw firstException ?: IllegalStateException("Groq API error")
+        throw lastError ?: IllegalStateException("Groq API error")
     }
 
-    private fun callOpenCompatibleChatApi(
+    private class ModelNotFoundException(message: String) : IllegalStateException(message)
+
+    private suspend fun callOpenCompatibleChatApi(
+        providerName: String,
         url: String,
         apiKey: String,
         model: String,
         systemInstruction: String,
         question: String,
-        isOpenRouter: Boolean
+        isOpenRouter: Boolean,
+        isEnglish: Boolean
     ): String {
-        val isReasoningModel = model.contains("r1", ignoreCase = true) ||
-            model.contains("reasoner", ignoreCase = true) ||
-            model.startsWith("o1", ignoreCase = true) ||
-            model.startsWith("o3", ignoreCase = true) ||
-            model.contains("qwen3", ignoreCase = true)
+        val trimmedModel = model.trim()
+        val lowerModel = trimmedModel.lowercase()
+        val usesMaxCompletionTokens = lowerModel.startsWith("o1") ||
+            lowerModel.startsWith("o3") ||
+            lowerModel.startsWith("o4") ||
+            lowerModel.startsWith("gpt-5")
+        val isReasoningModel = usesMaxCompletionTokens ||
+            lowerModel.contains("r1") ||
+            lowerModel.contains("reasoner") ||
+            lowerModel.contains("qwen3") ||
+            lowerModel.contains("2.5-pro") ||
+            lowerModel.contains("thinking")
 
-        val payload = buildJsonObject {
-            put("model", model.trim())
-            putJsonArray("messages") {
-                add(
-                    buildJsonObject {
-                        put("role", "system")
-                        put("content", systemInstruction)
+        for (minimalParams in listOf(false, true)) {
+            coroutineContext.ensureActive()
+            val payload = buildJsonObject {
+                put("model", trimmedModel)
+                putJsonArray("messages") {
+                    add(
+                        buildJsonObject {
+                            put("role", "system")
+                            put("content", systemInstruction)
+                        }
+                    )
+                    add(
+                        buildJsonObject {
+                            put("role", "user")
+                            put("content", question)
+                        }
+                    )
+                }
+                if (!minimalParams) {
+                    if (usesMaxCompletionTokens) {
+                        put("max_completion_tokens", 300)
+                    } else if (!isReasoningModel) {
+                        put("temperature", 0.1)
+                        put("max_tokens", 160)
+                    } else {
+                        put("max_tokens", 350)
                     }
-                )
-                add(
-                    buildJsonObject {
-                        put("role", "user")
-                        put("content", question)
-                    }
-                )
+                }
+            }.toString()
+
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer ${apiKey.trim()}")
+                .header("Accept", "application/json")
+
+            if (isOpenRouter) {
+                requestBuilder
+                    .header("HTTP-Referer", "https://nothing.tech/glyph-oracle")
+                    .header("X-Title", "Glyph Oracle Nothing Phone 3")
             }
-            if (!isReasoningModel) {
-                put("temperature", 0.1)
-                put("max_tokens", 24)
-            }
-        }.toString()
 
-        val requestBuilder = Request.Builder()
-            .url(url)
-            .header("Authorization", "Bearer ${apiKey.trim()}")
-            .header("Accept", "application/json")
+            val request = requestBuilder
+                .post(payload.toByteArray(Charsets.UTF_8).toRequestBody(jsonMediaType))
+                .build()
 
-        if (isOpenRouter) {
-            requestBuilder
-                .header("HTTP-Referer", "https://nothing.tech/glyph-oracle")
-                .header("X-Title", "Glyph Oracle Nothing Phone 3")
-        }
-
-        val request = requestBuilder
-            .post(payload.toByteArray(Charsets.UTF_8).toRequestBody(jsonMediaType))
-            .build()
-
-        okHttpClient.newCall(request).execute().use { response ->
-            val bodyString = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                val detailedError = extractApiErrorMessage(bodyString)
+            val (code, bodyString) = executeWithTransientRetry(request)
+            if (code !in 200..299) {
+                if (isModelNotFoundError(code, bodyString)) {
+                    throw ModelNotFoundException(
+                        formatHttpError(providerName, trimmedModel, code, bodyString, isEnglish)
+                    )
+                }
+                val lowerBody = bodyString.lowercase()
+                val isUnsupportedParamError = code == 400 && !minimalParams && (
+                    lowerBody.contains("max_tokens") ||
+                        lowerBody.contains("max_completion_tokens") ||
+                        lowerBody.contains("temperature") ||
+                        lowerBody.contains("unsupported")
+                    )
+                if (isUnsupportedParamError) {
+                    continue
+                }
                 throw IllegalStateException(
-                    "HTTP ${response.code} ($model): ${detailedError.ifBlank { response.message }}"
+                    formatHttpError(providerName, trimmedModel, code, bodyString, isEnglish)
                 )
             }
 
             val root = json.parseToJsonElement(bodyString).jsonObject
-            val content = root["choices"]?.jsonArray
+            val msgObj = root["choices"]?.jsonArray
                 ?.firstOrNull()?.jsonObject
                 ?.get("message")?.jsonObject
-                ?.get("content")?.jsonPrimitive?.content
+
+            val content = msgObj?.get("content")?.jsonPrimitive?.content
 
             if (content.isNullOrBlank()) {
-                throw IllegalStateException("Empty response from server ($model)")
+                throw IllegalStateException(
+                    if (isEnglish) "Empty response from $providerName ($trimmedModel)"
+                    else "Пустой ответ от $providerName ($trimmedModel)"
+                )
             }
             return content
         }
+        throw IllegalStateException("Failed to call $providerName ($trimmedModel)")
     }
 
-    private fun callGeminiWithFallback(
+    private suspend fun callGeminiWithFallback(
+        baseUrl: String,
         requestedModel: String,
         apiKey: String,
         systemInstruction: String,
-        question: String
+        question: String,
+        isEnglish: Boolean
     ): Pair<String, String> {
-        val cleanRequested = requestedModel.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
+        val cleanRequested = requestedModel.trim()
+            .removePrefix("models/")
+            .ifBlank { AiProvider.GEMINI.defaultModel }
+
         val candidates = linkedSetOf(
             cleanRequested,
-            "gemini-2.5-flash",
             "gemini-flash-latest",
-            "gemini-2.0-flash"
+            "gemini-2.5-flash"
         )
-        var firstError: Exception? = null
-        for (modelCandidate in candidates) {
+        var lastError: Exception? = null
+
+        for (candidate in candidates) {
+            coroutineContext.ensureActive()
             try {
                 val reply = callGeminiRestApi(
-                    model = modelCandidate,
+                    baseUrl = baseUrl,
+                    model = candidate,
                     apiKey = apiKey,
                     systemInstruction = systemInstruction,
-                    question = question
+                    question = question,
+                    isEnglish = isEnglish
                 )
-                return reply to modelCandidate
+                return reply to candidate
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: ModelNotFoundException) {
+                lastError = e
+                continue
             } catch (e: Exception) {
-                if (firstError == null) firstError = e
-                val msg = e.message.orEmpty()
-                if (msg.contains("API_KEY_INVALID", ignoreCase = true) || msg.contains("403")) {
-                    throw e
-                }
+                throw e
             }
         }
-        throw firstError ?: IllegalStateException("Gemini API error")
+        throw lastError ?: IllegalStateException("Gemini API error")
     }
 
-    private fun callGeminiRestApi(
+    private suspend fun callGeminiRestApi(
+        baseUrl: String,
         model: String,
         apiKey: String,
         systemInstruction: String,
-        question: String
+        question: String,
+        isEnglish: Boolean
     ): String {
-        val cleanModel = model.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=${apiKey.trim()}"
+        val cleanModel = model.trim()
+            .removePrefix("models/")
+            .ifBlank { AiProvider.GEMINI.defaultModel }
+        val url = "${baseUrl.trimEnd('/')}/models/$cleanModel:generateContent"
+        val isGemmaModel = cleanModel.startsWith("gemma", ignoreCase = true)
 
-        val payload = buildJsonObject {
-            putJsonObject("systemInstruction") {
-                putJsonArray("parts") {
-                    add(buildJsonObject { put("text", systemInstruction) })
-                }
-            }
-            putJsonArray("contents") {
-                add(
-                    buildJsonObject {
-                        putJsonArray("parts") {
-                            add(buildJsonObject { put("text", question) })
+        var lastException: Exception? = null
+        val thinkingModes = if (geminiUsesThinkingLevel(cleanModel) || geminiSupportsThinkingBudgetZero(cleanModel)) {
+            listOf(true, false)
+        } else {
+            listOf(false)
+        }
+
+        var tokenBudget = 256
+
+        for (includeThinkingConfig in thinkingModes) {
+            coroutineContext.ensureActive()
+            try {
+                val payload = buildJsonObject {
+                    if (!isGemmaModel) {
+                        putJsonObject("systemInstruction") {
+                            putJsonArray("parts") {
+                                add(buildJsonObject { put("text", systemInstruction) })
+                            }
                         }
                     }
-                )
-            }
-            putJsonObject("generationConfig") {
-                put("temperature", 0.1)
-                put("maxOutputTokens", 28)
-            }
-        }.toString()
+                    putJsonArray("contents") {
+                        add(
+                            buildJsonObject {
+                                put("role", "user")
+                                putJsonArray("parts") {
+                                    val promptText = if (isGemmaModel) {
+                                        "$systemInstruction\n\nQuestion: $question"
+                                    } else {
+                                        question
+                                    }
+                                    add(buildJsonObject { put("text", promptText) })
+                                }
+                            }
+                        )
+                    }
+                    putGeminiGenerationConfig(
+                        model = cleanModel,
+                        baseMaxTokens = tokenBudget,
+                        temperature = 0.1,
+                        includeThinkingConfig = includeThinkingConfig
+                    )
+                }.toString()
 
-        val request = Request.Builder()
-            .url(url)
-            .post(payload.toByteArray(Charsets.UTF_8).toRequestBody(jsonMediaType))
-            .build()
+                val request = Request.Builder()
+                    .url(url)
+                    .header("x-goog-api-key", apiKey.trim())
+                    .post(payload.toByteArray(Charsets.UTF_8).toRequestBody(jsonMediaType))
+                    .build()
 
-        okHttpClient.newCall(request).execute().use { response ->
-            val bodyString = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                val detailedError = extractApiErrorMessage(bodyString)
-                throw IllegalStateException(
-                    "Gemini HTTP ${response.code} ($cleanModel): ${detailedError.ifBlank { response.message }}"
-                )
+                val (code, bodyString) = executeWithTransientRetry(request)
+                if (code !in 200..299) {
+                    if (isModelNotFoundError(code, bodyString)) {
+                        throw ModelNotFoundException(
+                            formatHttpError("Gemini", cleanModel, code, bodyString, isEnglish)
+                        )
+                    }
+                    if (code == 400 && includeThinkingConfig) {
+                        lastException = IllegalStateException(
+                            formatHttpError("Gemini", cleanModel, code, bodyString, isEnglish)
+                        )
+                        continue
+                    }
+                    throw IllegalStateException(
+                        formatHttpError("Gemini", cleanModel, code, bodyString, isEnglish)
+                    )
+                }
+
+                val root = json.parseToJsonElement(bodyString).jsonObject
+                val candidateObj = root["candidates"]?.jsonArray?.firstOrNull()?.jsonObject
+                val finishReason = candidateObj?.get("finishReason")?.jsonPrimitive?.content.orEmpty()
+                val thoughtsTokens = root["usageMetadata"]?.jsonObject
+                    ?.get("thoughtsTokenCount")?.jsonPrimitive?.intOrNull ?: 0
+
+                if (finishReason == "SAFETY" || finishReason == "RECITATION" || finishReason == "PROHIBITED_CONTENT") {
+                    throw IllegalStateException(
+                        if (isEnglish) "Response blocked by Gemini safety filter ($finishReason)"
+                        else "Ответ заблокирован фильтром безопасности Gemini ($finishReason)"
+                    )
+                }
+
+                val text = extractGeminiResponseText(root).replace('\n', ' ').trim()
+
+                if (text.isBlank()) {
+                    if (finishReason == "MAX_TOKENS" || thoughtsTokens > 0) {
+                        tokenBudget = 1024
+                    }
+                    if (includeThinkingConfig) {
+                        lastException = IllegalStateException(
+                            if (isEnglish) "Empty Gemini response ($cleanModel, finishReason=$finishReason)"
+                            else "Пустой ответ Gemini ($cleanModel, причина=$finishReason)"
+                        )
+                        continue
+                    }
+                    throw IllegalStateException(
+                        if (isEnglish) "Empty Gemini response ($cleanModel, finishReason=$finishReason)"
+                        else "Пустой ответ Gemini ($cleanModel, причина=$finishReason)"
+                    )
+                }
+                return text
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: ModelNotFoundException) {
+                throw e
+            } catch (e: Exception) {
+                lastException = e
+                if (!includeThinkingConfig) throw e
             }
-
-            val root = json.parseToJsonElement(bodyString).jsonObject
-            val text = root["candidates"]?.jsonArray
-                ?.firstOrNull()?.jsonObject
-                ?.get("content")?.jsonObject
-                ?.get("parts")?.jsonArray
-                ?.firstOrNull()?.jsonObject
-                ?.get("text")?.jsonPrimitive?.content
-
-            if (text.isNullOrBlank()) {
-                throw IllegalStateException("Empty Gemini API response ($cleanModel)")
-            }
-            return text
         }
+
+        throw lastException ?: IllegalStateException("Gemini API error ($cleanModel)")
+    }
+
+    private fun geminiUsesThinkingLevel(model: String): Boolean {
+        val lower = model.lowercase()
+        return lower.startsWith("gemini-3") || lower.contains("gemini-3.")
+    }
+
+    private fun geminiSupportsThinkingBudgetZero(model: String): Boolean {
+        val lower = model.lowercase()
+        return (lower.contains("2.5") && lower.contains("flash")) ||
+            lower.contains("3.5-flash") ||
+            lower == "gemini-flash-latest" ||
+            lower == "gemini-flash-lite-latest"
+    }
+
+    private fun JsonObjectBuilder.putGeminiGenerationConfig(
+        model: String,
+        baseMaxTokens: Int,
+        temperature: Double = 0.1,
+        includeThinkingConfig: Boolean = true
+    ) {
+        val isProOrThinking = model.contains("pro", ignoreCase = true) ||
+            model.contains("thinking", ignoreCase = true) ||
+            geminiUsesThinkingLevel(model)
+
+        putJsonObject("generationConfig") {
+            if (includeThinkingConfig && geminiUsesThinkingLevel(model)) {
+                put("maxOutputTokens", if (isProOrThinking) 1024 else maxOf(baseMaxTokens, 300))
+                putJsonObject("thinkingConfig") {
+                    put("thinkingLevel", "low")
+                }
+            } else if (isProOrThinking) {
+                put("temperature", temperature)
+                put("maxOutputTokens", 1024)
+            } else {
+                put("temperature", temperature)
+                put("maxOutputTokens", maxOf(baseMaxTokens, 256))
+                if (includeThinkingConfig && geminiSupportsThinkingBudgetZero(model)) {
+                    putJsonObject("thinkingConfig") {
+                        put("thinkingBudget", 0)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Extracts only non-thought text parts from a Gemini response so internal reasoning
+     * (`"thought": true`) from Gemini 2.5 / 3.x never overwrites the short answer.
+     */
+    internal fun extractGeminiResponseText(root: JsonObject): String {
+        val parts = root["candidates"]?.jsonArray
+            ?.firstOrNull()?.jsonObject
+            ?.get("content")?.jsonObject
+            ?.get("parts")?.jsonArray
+            ?: return ""
+
+        val nonThoughtTexts = parts.mapNotNull { partEl ->
+            val obj = partEl.jsonObject
+            val isThought = obj["thought"]?.jsonPrimitive?.booleanOrNull == true
+            if (isThought) null else obj["text"]?.jsonPrimitive?.content
+        }.map { it.trim() }.filter { it.isNotEmpty() }
+
+        return nonThoughtTexts.joinToString("\n").trim()
     }
 
     private fun extractApiErrorMessage(errorBody: String): String {
@@ -944,30 +1422,54 @@ object AiOracleClient {
         }
     }
 
-    fun sanitizeUltraShortAnswer(raw: String, maxWords: Int): String {
-        val withoutThink = raw.replace(Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE), "")
-            .trim()
+    fun sanitizeUltraShortAnswer(
+        raw: String,
+        maxWords: Int,
+        isEnglish: Boolean = false
+    ): String {
+        val withoutClosedThink = raw.replace(
+            Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE),
+            ""
+        )
+        val withoutThink = withoutClosedThink.replace(
+            Regex("<think>[\\s\\S]*$", RegexOption.IGNORE_CASE),
+            ""
+        ).trim()
 
-        val firstLine = withoutThink
+        val nonEmptyLines = withoutThink
             .lines()
-            .firstOrNull { it.isNotBlank() }
-            ?: withoutThink
+            .map { it.trim() }
+            .filter { it.isNotBlank() && !it.startsWith("Thinking Process:", ignoreCase = true) }
 
-        val cleaned = firstLine
+        val answerPrefixRegex = Regex("^(?:A|Answer|Ответ|Итог)\\s*:\\s*", RegexOption.IGNORE_CASE)
+        val labeledLine = nonEmptyLines.lastOrNull { answerPrefixRegex.containsMatchIn(it) }
+            ?.replaceFirst(answerPrefixRegex, "")
+
+        val chosenLine = when {
+            !labeledLine.isNullOrBlank() -> labeledLine
+            nonEmptyLines.size > 1 -> {
+                val last = nonEmptyLines.last()
+                val first = nonEmptyLines.first()
+                if (last.split(Regex("\\s+")).size <= maxWords + 2) last else first
+            }
+            else -> nonEmptyLines.firstOrNull().orEmpty()
+        }
+
+        val cleaned = chosenLine
             .replace("*", "")
             .replace("\"", "")
             .replace("«", "")
             .replace("»", "")
-            .replace("'", "")
             .replace("`", "")
+            .replace("’", "'")
             .trim()
-            .trimEnd('.', '!', ',', ';')
+            .trim('\'', '.', '!', ',', ';', ':')
             .trim()
 
         if (cleaned.isEmpty()) return "?"
 
         val words = cleaned.split(Regex("\\s+")).filter { it.isNotBlank() }
         val limited = words.take(maxWords.coerceIn(1, 5)).joinToString(" ")
-        return limited.uppercase()
+        return limited.uppercase(if (isEnglish) java.util.Locale.US else java.util.Locale.getDefault())
     }
 }

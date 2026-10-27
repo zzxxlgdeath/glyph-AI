@@ -23,14 +23,19 @@ import com.example.data.OracleSettingsRepository
 import com.example.data.VoiceCaptureMode
 import com.example.network.AiOracleClient
 import com.example.network.AiOracleResult
+import com.nothing.ketchum.Common
 import com.nothing.ketchum.Glyph
-import com.nothing.ketchum.GlyphMatrixFrame
 import com.nothing.ketchum.GlyphMatrixManager
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -67,9 +72,18 @@ sealed class ToyOracleState {
 @OptIn(ExperimentalCoroutinesApi::class)
 class GlyphOracleCoordinator private constructor(private val appContext: Context) {
 
+    private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        if (throwable !is CancellationException) {
+            Log.e(TAG, "Uncaught coroutine exception in GlyphOracleCoordinator", throwable)
+            mainHandler.post {
+                showError(throwable.localizedMessage ?: "Unexpected internal error")
+            }
+        }
+    }
+
     private val hardwareDispatcher = Dispatchers.IO.limitedParallelism(1)
-    private val hardwareScope = CoroutineScope(SupervisorJob() + hardwareDispatcher)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val hardwareScope = CoroutineScope(SupervisorJob() + hardwareDispatcher + exceptionHandler)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + exceptionHandler)
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val settingsRepo = OracleSettingsRepository.getInstance(appContext)
@@ -95,6 +109,13 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
     @Volatile
     private var glyphManager: GlyphMatrixManager? = null
 
+    private val isBindingHardware = AtomicBoolean(false)
+    private val sessionToken = AtomicLong(0L)
+
+    // Conflated channel + reusable hardware buffer to avoid per-frame coroutine & Builder allocations
+    private val hardwareFrameChannel = Channel<IntArray>(Channel.CONFLATED)
+    private val reusableHardwareBuffer = IntArray(PixelMatrixRenderer.TOTAL_PIXELS)
+
     private var speechRecognizer: SpeechRecognizer? = null
     private var lockScreenRecorder: LockScreenAudioRecorder? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -109,15 +130,20 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
 
     private val glyphCallback = object : GlyphMatrixManager.Callback {
         override fun onServiceConnected(componentName: ComponentName?) {
+            isBindingHardware.set(false)
             hardwareScope.launch {
                 try {
                     val manager = glyphManager ?: GlyphMatrixManager.getInstance(appContext).also {
                         glyphManager = it
                     }
+                    val isPhone3 = runCatching { Common.is23112() }.getOrDefault(false)
                     val registered = manager.register(Glyph.DEVICE_23112)
                     _isHardwareConnected.value = registered
-                    Log.d(TAG, "GlyphService connected, register(DEVICE_23112) = $registered")
-                    pushFrameToHardwareInternal(_matrixFrame.value)
+                    Log.d(
+                        TAG,
+                        "GlyphService connected (Common.is23112=$isPhone3), register(DEVICE_23112)=$registered"
+                    )
+                    hardwareFrameChannel.trySend(_matrixFrame.value)
                 } catch (t: Throwable) {
                     Log.w(TAG, "Glyph register error: ${t.message}")
                     _isHardwareConnected.value = false
@@ -126,13 +152,23 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
         }
 
         override fun onServiceDisconnected(componentName: ComponentName?) {
+            isBindingHardware.set(false)
             _isHardwareConnected.value = false
         }
     }
 
     init {
+        startHardwareFrameWorker()
         ensureHardwareInitialized()
         showIdleState()
+    }
+
+    private fun startHardwareFrameWorker() {
+        hardwareScope.launch {
+            for (uiPixels in hardwareFrameChannel) {
+                pushFrameToHardwareInternal(uiPixels)
+            }
+        }
     }
 
     fun ensureHardwareInitialized() {
@@ -143,11 +179,12 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                 }
                 if (_isHardwareConnected.value) {
                     manager.register(Glyph.DEVICE_23112)
-                    pushFrameToHardwareInternal(_matrixFrame.value)
-                } else {
+                    hardwareFrameChannel.trySend(_matrixFrame.value)
+                } else if (isBindingHardware.compareAndSet(false, true)) {
                     manager.init(glyphCallback)
                 }
             } catch (t: Throwable) {
+                isBindingHardware.set(false)
                 Log.w(TAG, "GlyphMatrixManager init fallback: ${t.message}")
                 _isHardwareConnected.value = false
             }
@@ -157,9 +194,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
     fun onAppForeground() {
         isAppInForeground = true
         ensureHardwareInitialized()
-        hardwareScope.launch {
-            pushFrameToHardwareInternal(_matrixFrame.value)
-        }
+        hardwareFrameChannel.trySend(_matrixFrame.value)
     }
 
     fun onAppBackground() {
@@ -191,13 +226,34 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
 
     fun onToyServiceUnbind() {
         _isToyServiceBound.value = false
-        mainHandler.post { stopListeningInternal() }
-        releaseWakeLock()
+        sessionToken.incrementAndGet()
+        mainHandler.post {
+            activeQueryJob?.cancel()
+            activeQueryJob = null
+            animationJob?.cancel()
+            animationJob = null
+            stopListeningInternal()
+            releaseWakeLock()
+            _oracleState.value = ToyOracleState.Idle
+        }
         hardwareScope.launch {
             try {
                 setHardwareTimeoutDisabledInternal(false)
                 glyphManager?.turnOff()
+                if (!isAppInForeground) {
+                    isBindingHardware.set(false)
+                    _isHardwareConnected.value = false
+                    glyphManager?.unInit()
+                }
             } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun dismissError() {
+        mainHandler.post {
+            if (_oracleState.value is ToyOracleState.Error) {
+                showIdleState()
             }
         }
     }
@@ -239,33 +295,34 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                 return@post
             }
 
+            val token = sessionToken.incrementAndGet()
             activeQueryJob?.cancel()
             stopListeningInternal()
             acquireWakeLock()
 
-            // Pre-warm TLS/HTTP2 socket to the active AI provider while the user is speaking!
             scope.launch {
                 AiOracleClient.prewarmConnection(currentSettings)
             }
 
             val mode = currentSettings.voiceCaptureMode
             val inBackgroundOrLocked = !isAppInForeground || isDeviceLockedOrScreenOff()
+            val prefersCloudStt = currentSettings.sttProvider != com.example.data.SttProvider.AUTO
 
             val useDirectAudioRecord = when (mode) {
                 VoiceCaptureMode.ALWAYS_AUDIORECORD -> true
                 VoiceCaptureMode.AUTO_HYBRID ->
-                    inBackgroundOrLocked || !SpeechRecognizer.isRecognitionAvailable(appContext)
+                    inBackgroundOrLocked || prefersCloudStt || !SpeechRecognizer.isRecognitionAvailable(appContext)
             }
 
             if (useDirectAudioRecord) {
-                startDirectAudioRecordListening()
+                startDirectAudioRecordListening(token)
             } else {
-                startAndroidSpeechRecognizer(fallbackToAudioRecordOnError = true)
+                startAndroidSpeechRecognizer(token, fallbackToAudioRecordOnError = true)
             }
         }
     }
 
-    private fun startDirectAudioRecordListening() {
+    private fun startDirectAudioRecordListening(token: Long) {
         val currentSettings = settingsRepo.settings.value
         val isEn = currentSettings.isEnglish
         setHardwareTimeoutDisabled(true)
@@ -285,23 +342,33 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
             silenceTimeoutMs = currentSettings.silenceTimeoutMs.toLong(),
             isEnglish = isEn,
             onRmsChanged = { rmsDb ->
-                val current = _oracleState.value
-                if (current is ToyOracleState.Listening && kotlin.math.abs(current.rmsDb - rmsDb) >= 0.7f) {
-                    _oracleState.value = current.copy(rmsDb = rmsDb)
+                if (sessionToken.get() == token) {
+                    val current = _oracleState.value
+                    if (current is ToyOracleState.Listening && kotlin.math.abs(current.rmsDb - rmsDb) >= 0.7f) {
+                        _oracleState.value = current.copy(rmsDb = rmsDb)
+                    }
                 }
             },
             onRecordingComplete = { wavBytes ->
-                processRecordedWavAudio(wavBytes)
+                mainHandler.post {
+                    if (sessionToken.get() == token) {
+                        processRecordedWavAudio(token, wavBytes)
+                    }
+                }
             },
             onError = { errMsg ->
-                showError(errMsg)
+                mainHandler.post {
+                    if (sessionToken.get() == token) {
+                        showError(errMsg)
+                    }
+                }
             }
         )
         lockScreenRecorder = recorder
         recorder.start()
     }
 
-    private fun processRecordedWavAudio(wavBytes: ByteArray) {
+    private fun processRecordedWavAudio(token: Long, wavBytes: ByteArray) {
         val currentSettings = settingsRepo.settings.value
         val isEn = currentSettings.isEnglish
         _oracleState.value = ToyOracleState.Thinking(
@@ -313,20 +380,53 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
         activeQueryJob?.cancel()
         activeQueryJob = scope.launch {
             val result = AiOracleClient.processAudioAndAskOracle(wavBytes, currentSettings)
+            if (sessionToken.get() != token) return@launch
             result.fold(
                 onSuccess = { oracleResult ->
-                    handleOracleSuccess(oracleResult)
+                    handleOracleSuccess(token, oracleResult)
                 },
                 onFailure = { error ->
-                    showError(
-                        error.message ?: if (isEn) "Voice recognition failed" else "Ошибка распознавания аудио"
-                    )
+                    if (error is CancellationException) throw error
+                    mainHandler.post {
+                        if (sessionToken.get() == token) {
+                            showError(
+                                error.message ?: if (isEn) "Voice recognition failed" else "Ошибка распознавания аудио"
+                            )
+                        }
+                    }
                 }
             )
         }
     }
 
-    private fun startAndroidSpeechRecognizer(fallbackToAudioRecordOnError: Boolean) {
+    private fun scheduleSpeechWatchdog(
+        token: Long,
+        fallbackToAudioRecordOnError: Boolean,
+        isEn: Boolean,
+        timeoutMs: Long = 8_000L
+    ) {
+        speechWatchdogJob?.cancel()
+        speechWatchdogJob = scope.launch {
+            delay(timeoutMs)
+            mainHandler.post {
+                if (sessionToken.get() != token) return@post
+                val state = _oracleState.value
+                if (state is ToyOracleState.Listening && !state.isDirectAudioRecord) {
+                    val partial = lastPartialTranscript.trim()
+                    stopSpeechRecognizerOnly()
+                    if (partial.isNotBlank()) {
+                        submitQuestion(partial)
+                    } else if (fallbackToAudioRecordOnError) {
+                        startDirectAudioRecordListening(token)
+                    } else {
+                        showError(if (isEn) "Speech recognition timed out" else "Время ожидания речи истекло")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startAndroidSpeechRecognizer(token: Long, fallbackToAudioRecordOnError: Boolean) {
         try {
             val currentSettings = settingsRepo.settings.value
             val isEn = currentSettings.isEnglish
@@ -339,31 +439,15 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
             )
             startListeningAnimationLoop()
 
+            stopSpeechRecognizerOnly()
             val recognizer = SpeechRecognizer.createSpeechRecognizer(appContext)
             speechRecognizer = recognizer
 
-            speechWatchdogJob?.cancel()
-            speechWatchdogJob = scope.launch {
-                delay(8_000L)
-                if (_oracleState.value is ToyOracleState.Listening &&
-                    !(_oracleState.value as ToyOracleState.Listening).isDirectAudioRecord
-                ) {
-                    mainHandler.post {
-                        val partial = lastPartialTranscript.trim()
-                        stopSpeechRecognizerOnly()
-                        if (partial.isNotBlank()) {
-                            submitQuestion(partial)
-                        } else if (fallbackToAudioRecordOnError) {
-                            startDirectAudioRecordListening()
-                        } else {
-                            showError(if (isEn) "Speech recognition timed out" else "Время ожидания речи истекло")
-                        }
-                    }
-                }
-            }
+            scheduleSpeechWatchdog(token, fallbackToAudioRecordOnError, isEn, 8_000L)
 
             recognizer.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {
+                    if (sessionToken.get() != token) return
                     _oracleState.value = ToyOracleState.Listening(
                         partialText = "",
                         rmsDb = 2f,
@@ -371,9 +455,13 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                     )
                 }
 
-                override fun onBeginningOfSpeech() {}
+                override fun onBeginningOfSpeech() {
+                    if (sessionToken.get() != token) return
+                    scheduleSpeechWatchdog(token, fallbackToAudioRecordOnError, isEn, 8_000L)
+                }
 
                 override fun onRmsChanged(rmsdB: Float) {
+                    if (sessionToken.get() != token) return
                     val current = _oracleState.value
                     if (current is ToyOracleState.Listening && kotlin.math.abs(current.rmsDb - rmsdB) >= 0.8f) {
                         _oracleState.value = current.copy(rmsDb = rmsdB)
@@ -385,6 +473,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                 override fun onEndOfSpeech() {}
 
                 override fun onError(error: Int) {
+                    if (sessionToken.get() != token) return
                     speechWatchdogJob?.cancel()
                     val fallbackText = lastPartialTranscript.trim()
                     stopSpeechRecognizerOnly()
@@ -392,7 +481,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                         submitQuestion(fallbackText)
                     } else if (fallbackToAudioRecordOnError) {
                         Log.w(TAG, "SpeechRecognizer error $error -> switching to AudioRecord")
-                        startDirectAudioRecordListening()
+                        startDirectAudioRecordListening(token)
                     } else {
                         val errorDesc = mapSpeechError(error, isEn)
                         showError(errorDesc)
@@ -400,6 +489,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                 }
 
                 override fun onResults(results: Bundle?) {
+                    if (sessionToken.get() != token) return
                     speechWatchdogJob?.cancel()
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     val spokenText = matches?.firstOrNull()?.trim().orEmpty()
@@ -408,7 +498,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                     if (spokenText.isNotBlank()) {
                         submitQuestion(spokenText)
                     } else if (fallbackToAudioRecordOnError) {
-                        startDirectAudioRecordListening()
+                        startDirectAudioRecordListening(token)
                     } else {
                         showError(
                             if (isEn) "Speech not recognized. Try again."
@@ -418,6 +508,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
+                    if (sessionToken.get() != token) return
                     val partial = partialResults
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
@@ -425,6 +516,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                         .orEmpty()
                     if (partial.isNotBlank() && partial != lastPartialTranscript) {
                         lastPartialTranscript = partial
+                        scheduleSpeechWatchdog(token, fallbackToAudioRecordOnError, isEn, 6_000L)
                         val current = _oracleState.value
                         if (current is ToyOracleState.Listening) {
                             _oracleState.value = current.copy(partialText = partial)
@@ -435,16 +527,18 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
 
-            val lang = currentSettings.speechLanguage
-            val completeSilenceMs = currentSettings.silenceTimeoutMs.toLong().coerceIn(600L, 1800L)
-            val possibleSilenceMs = (completeSilenceMs - 220L).coerceAtLeast(500L)
+            val localeTag = currentSettings.getRecognizerLocaleTag()
+            val completeSilenceMs = currentSettings.silenceTimeoutMs.toLong().coerceIn(1100L, 2200L)
+            val possibleSilenceMs = (completeSilenceMs - 200L).coerceAtLeast(900L)
 
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                     RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
                 )
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+                if (!localeTag.isNullOrBlank()) {
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
+                }
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                 putExtra(
@@ -460,7 +554,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
             recognizer.startListening(intent)
         } catch (e: Exception) {
             if (fallbackToAudioRecordOnError) {
-                startDirectAudioRecordListening()
+                startDirectAudioRecordListening(token)
             } else {
                 showError("Mic error: ${e.localizedMessage ?: "unknown"}")
             }
@@ -489,15 +583,30 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
         val cleanQuestion = question.trim()
         if (cleanQuestion.isEmpty()) return
 
-        activeQueryJob?.cancel()
-        mainHandler.post { stopListeningInternal() }
+        mainHandler.post {
+            val currentSettings = settingsRepo.settings.value
+            if (!currentSettings.hasActiveApiKey) {
+                val msg = if (currentSettings.isEnglish) {
+                    "Enter an API key for ${currentSettings.selectedProvider.displayName} in settings first"
+                } else {
+                    "Сначала введите API-ключ для ${currentSettings.selectedProvider.displayName} в настройках"
+                }
+                showError(msg)
+                return@post
+            }
 
-        activeQueryJob = scope.launch {
-            executeOracleQuery(cleanQuestion)
+            val token = sessionToken.incrementAndGet()
+            activeQueryJob?.cancel()
+            stopListeningInternal()
+            acquireWakeLock()
+
+            activeQueryJob = scope.launch {
+                executeOracleQuery(token, cleanQuestion)
+            }
         }
     }
 
-    private suspend fun executeOracleQuery(cleanQuestion: String) {
+    private suspend fun executeOracleQuery(token: Long, cleanQuestion: String) {
         val currentSettings = settingsRepo.settings.value
         _oracleState.value = ToyOracleState.Thinking(
             question = cleanQuestion,
@@ -506,22 +615,29 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
         startThinkingAnimationLoop()
 
         val result = AiOracleClient.askOracle(cleanQuestion, currentSettings)
+        if (sessionToken.get() != token) return
         result.fold(
             onSuccess = { oracleResult ->
-                handleOracleSuccess(oracleResult)
+                handleOracleSuccess(token, oracleResult)
             },
             onFailure = { error ->
+                if (error is CancellationException) throw error
                 val fallbackMsg = if (currentSettings.isEnglish) {
                     "AI connection error"
                 } else {
                     "Ошибка соединения с нейросетью"
                 }
-                showError(error.message ?: fallbackMsg)
+                mainHandler.post {
+                    if (sessionToken.get() == token) {
+                        showError(error.message ?: fallbackMsg)
+                    }
+                }
             }
         )
     }
 
-    private suspend fun handleOracleSuccess(oracleResult: AiOracleResult) {
+    private suspend fun handleOracleSuccess(token: Long, oracleResult: AiOracleResult) {
+        if (sessionToken.get() != token) return
         val isStatic = PixelMatrixRenderer.shouldDisplayStatically(oracleResult.answer)
         lastDisplayedAnswer = oracleResult.answer
         vibrateShortTick()
@@ -537,12 +653,14 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
             )
         )
 
-        displayAnswerOnMatrix(
-            question = oracleResult.question,
-            answer = oracleResult.answer,
-            providerName = oracleResult.provider.displayName,
-            latencyMs = oracleResult.latencyMs
-        )
+        if (sessionToken.get() == token) {
+            displayAnswerOnMatrix(
+                question = oracleResult.question,
+                answer = oracleResult.answer,
+                providerName = oracleResult.provider.displayName,
+                latencyMs = oracleResult.latencyMs
+            )
+        }
     }
 
     fun displayAnswerOnMatrix(
@@ -551,7 +669,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
         providerName: String = settingsRepo.settings.value.selectedProvider.displayName,
         latencyMs: Long = 0L
     ) {
-        val cleanAnswer = answer.trim().uppercase()
+        val cleanAnswer = PixelMatrixRenderer.normalizeForMatrix(answer)
         val isStatic = PixelMatrixRenderer.shouldDisplayStatically(cleanAnswer)
         lastDisplayedAnswer = cleanAnswer
 
@@ -565,36 +683,38 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
 
         animationJob?.cancel()
         animationJob = scope.launch {
-            setHardwareTimeoutDisabled(true)
-            val settings = settingsRepo.settings.value
-            val brightness = settings.matrixBrightness
+            try {
+                setHardwareTimeoutDisabled(true)
+                val settings = settingsRepo.settings.value
+                val brightness = settings.matrixBrightness
 
-            if (isStatic) {
-                val staticFrame = PixelMatrixRenderer.renderStaticAnswer(cleanAnswer, brightness)
-                updateMatrixFrame(staticFrame)
-                delay(8_500L)
-            } else {
-                val textWidth = PixelMatrixRenderer.measureTextWidth(cleanAnswer)
-                val scrollSpeed = settings.scrollSpeedMs.toLong().coerceIn(35L, 150L)
-                repeat(3) {
-                    for (offset in 0..(textWidth + PixelMatrixRenderer.MATRIX_SIZE + 4)) {
-                        if (!isActive) return@launch
-                        val currentBrightness = settingsRepo.settings.value.matrixBrightness
-                        val frame = PixelMatrixRenderer.renderMarqueeAnswer(
-                            text = cleanAnswer,
-                            scrollOffsetPx = offset,
-                            brightness = currentBrightness
-                        )
-                        updateMatrixFrame(frame)
-                        delay(scrollSpeed)
+                if (isStatic) {
+                    val staticFrame = PixelMatrixRenderer.renderStaticAnswer(cleanAnswer, brightness)
+                    updateMatrixFrame(staticFrame)
+                    delay(8_500L)
+                } else {
+                    val textWidth = PixelMatrixRenderer.measureTextWidth(cleanAnswer)
+                    val scrollSpeed = settings.scrollSpeedMs.toLong().coerceIn(35L, 160L)
+                    repeat(3) {
+                        for (offset in 0..(textWidth + PixelMatrixRenderer.MATRIX_SIZE + 4)) {
+                            if (!isActive) return@launch
+                            val currentBrightness = settingsRepo.settings.value.matrixBrightness
+                            val frame = PixelMatrixRenderer.renderMarqueeAnswer(
+                                text = cleanAnswer,
+                                scrollOffsetPx = offset,
+                                brightness = currentBrightness
+                            )
+                            updateMatrixFrame(frame)
+                            delay(scrollSpeed)
+                        }
+                        delay(300L)
                     }
-                    delay(300L)
                 }
+                showIdleState()
+            } finally {
+                setHardwareTimeoutDisabled(false)
+                releaseWakeLock()
             }
-
-            setHardwareTimeoutDisabled(false)
-            releaseWakeLock()
-            showIdleState()
         }
     }
 
@@ -663,28 +783,36 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
         }
     }
 
+    /**
+     * Keeps `ToyOracleState.Error` visible in the app UI until the user dismisses it or starts a new query,
+     * while blinking "ERR" on the physical 25x25 LED matrix for 3 seconds and then returning the rear LEDs
+     * to the low-power idle glyph.
+     */
     private fun showError(message: String) {
         _oracleState.value = ToyOracleState.Error(message)
         animationJob?.cancel()
         animationJob = scope.launch {
-            repeat(15) {
-                tickCounter++
+            try {
+                repeat(15) {
+                    if (!isActive) return@launch
+                    tickCounter++
+                    val brightness = settingsRepo.settings.value.matrixBrightness
+                    val frame = PixelMatrixRenderer.renderErrorFrame(tickCounter, brightness)
+                    updateMatrixFrame(frame)
+                    delay(200L)
+                }
                 val brightness = settingsRepo.settings.value.matrixBrightness
-                val frame = PixelMatrixRenderer.renderErrorFrame(tickCounter, brightness)
-                updateMatrixFrame(frame)
-                delay(200L)
+                updateMatrixFrame(PixelMatrixRenderer.renderIdleGlyph(4, brightness))
+            } finally {
+                setHardwareTimeoutDisabled(false)
+                releaseWakeLock()
             }
-            setHardwareTimeoutDisabled(false)
-            releaseWakeLock()
-            showIdleState()
         }
     }
 
     private fun updateMatrixFrame(rawPixels: IntArray) {
         _matrixFrame.value = rawPixels
-        hardwareScope.launch {
-            pushFrameToHardwareInternal(rawPixels)
-        }
+        hardwareFrameChannel.trySend(rawPixels)
     }
 
     private fun pushFrameToHardwareInternal(uiPixels: IntArray) {
@@ -693,19 +821,14 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
         if (!_isToyServiceBound.value && !isAppInForeground) return
 
         try {
-            val hardwarePixels = PixelMatrixRenderer.toHardwareMatrixArray(uiPixels)
-            val frame = GlyphMatrixFrame.Builder()
-                .addTop(hardwarePixels)
-                .build(appContext)
-            val rendered = frame.render()
-
+            val hardwarePixels = PixelMatrixRenderer.toHardwareMatrixArray(uiPixels, reusableHardwareBuffer)
             if (_isToyServiceBound.value) {
-                manager.setMatrixFrame(rendered)
+                manager.setMatrixFrame(hardwarePixels)
             } else {
                 try {
-                    manager.setAppMatrixFrame(rendered)
+                    manager.setAppMatrixFrame(hardwarePixels)
                 } catch (_: Throwable) {
-                    manager.setMatrixFrame(rendered)
+                    manager.setMatrixFrame(hardwarePixels)
                 }
             }
         } catch (t: Throwable) {
@@ -742,8 +865,10 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
             val wl = pm.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "GlyphOracle::VoiceSessionWakeLock"
-            )
-            wl.acquire(25_000L)
+            ).apply {
+                setReferenceCounted(false)
+            }
+            wl.acquire(60_000L)
             wakeLock = wl
         } catch (_: Throwable) {
         }

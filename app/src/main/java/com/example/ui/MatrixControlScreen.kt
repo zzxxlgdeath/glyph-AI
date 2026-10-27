@@ -26,6 +26,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Mic
@@ -39,6 +40,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -82,6 +84,7 @@ fun MatrixControlScreen(
     onSubmitTextQuestion: (String) -> Unit,
     onReplayAnswer: (String, String) -> Unit,
     onOpenAiSettings: () -> Unit,
+    onDismissError: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var manualQuestion by rememberSaveable { mutableStateOf("") }
@@ -104,7 +107,6 @@ fun MatrixControlScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Top Status Strip (Equal-height Provider Card + Hardware Connection Card)
             HardwareStatusStrip(
                 settings = settings,
                 isHardwareConnected = isHardwareConnected,
@@ -112,7 +114,6 @@ fun MatrixControlScreen(
                 onOpenAiSettings = onOpenAiSettings
             )
 
-            // Missing API Key Banner with quick navigation CTA
             if (!hasApiKey) {
                 Card(
                     modifier = Modifier
@@ -190,7 +191,6 @@ fun MatrixControlScreen(
                 }
             }
 
-            // Main Matrix Monitor Card (single 25×25 header in the app)
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -226,7 +226,6 @@ fun MatrixControlScreen(
 
                     Spacer(modifier = Modifier.height(18.dp))
 
-                    // Circular Matrix Display (isolated recomposition scope)
                     GlyphMatrix25x25Visualizer(
                         matrixFrameFlow = matrixFrameFlow,
                         isListening = isListening,
@@ -235,18 +234,17 @@ fun MatrixControlScreen(
 
                     Spacer(modifier = Modifier.height(18.dp))
 
-                    // Live Readout Box (Question & Ultra-short Answer)
                     OracleReadoutPanel(
                         oracleState = oracleState,
                         hasApiKey = hasApiKey,
                         providerName = settings.selectedProvider.displayName,
                         isEnglish = isEn,
-                        onReplayAnswer = onReplayAnswer
+                        onReplayAnswer = onReplayAnswer,
+                        onDismissError = onDismissError
                     )
                 }
             }
 
-            // Primary Glyph Button Voice Trigger (disabled when no API key is entered)
             Button(
                 onClick = {
                     if (isListening) onStopListening() else onGlyphButtonTrigger()
@@ -287,7 +285,6 @@ fun MatrixControlScreen(
                 )
             }
 
-            // Text Question Input Card (disabled when no API key is entered)
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
@@ -578,7 +575,8 @@ private fun OracleReadoutPanel(
     hasApiKey: Boolean,
     providerName: String,
     isEnglish: Boolean,
-    onReplayAnswer: (String, String) -> Unit
+    onReplayAnswer: (String, String) -> Unit,
+    onDismissError: () -> Unit
 ) {
     Surface(
         modifier = Modifier
@@ -586,7 +584,10 @@ private fun OracleReadoutPanel(
             .testTag("oracle_readout_panel"),
         shape = RoundedCornerShape(16.dp),
         color = NothingCardElevated,
-        border = BorderStroke(1.dp, NothingBorder)
+        border = BorderStroke(
+            1.dp,
+            if (oracleState is ToyOracleState.Error) NothingRed else NothingBorder
+        )
     ) {
         Column(
             modifier = Modifier
@@ -759,6 +760,31 @@ private fun OracleReadoutPanel(
                         color = NothingWhite,
                         textAlign = TextAlign.Center
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    OutlinedButton(
+                        onClick = onDismissError,
+                        modifier = Modifier
+                            .height(36.dp)
+                            .testTag("dismiss_error_button"),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, NothingBorder)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Close,
+                            contentDescription = null,
+                            tint = NothingWhite,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isEnglish) "DISMISS" else "ЗАКРЫТЬ",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = NothingWhite,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
                 }
             }
         }
