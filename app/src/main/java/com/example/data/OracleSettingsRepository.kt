@@ -119,70 +119,71 @@ enum class SttProvider(
     fun getLabel(isEnglish: Boolean): String = if (isEnglish) labelEn else labelRu
 }
 
+private val EXCLUDED_MODEL_KEYWORDS = listOf(
+    "gemma",
+    "gemini-1.",
+    "gemini-2.0",
+    "gemini-exp",
+    "gemini-3.1-flash-lite-preview",
+    "llama-4-maverick",
+    "llama-4-scout",
+    "qwen3-32b",
+    "image",
+    "imagen",
+    "vision",
+    "-vl",
+    "llava",
+    "pixtral",
+    "flux",
+    "sdxl",
+    "stable-diffusion",
+    "dall-e",
+    "sora",
+    "veo",
+    "lyria",
+    "whisper",
+    "guard",
+    "prompt-guard",
+    "tts",
+    "playai",
+    "orpheus",
+    "embedding",
+    "moderation",
+    "babbage",
+    "davinci",
+    "curie",
+    "ada",
+    "realtime",
+    "transcribe",
+    "audio",
+    "live",
+    "search",
+    "computer-use",
+    "robotics",
+    "rerank",
+    "canary",
+    "aqa",
+    "learnlm",
+    "thinking-exp",
+    "customtools",
+    "gpt-3.5",
+    "deepseek-r1-distill",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b",
+    "llama-3.2-",
+    "qwen-qwq",
+    "mistral-saba",
+    "allam",
+    "compound"
+)
+
 fun isActiveSupportedTextModel(rawId: String, provider: AiProvider): Boolean {
     val id = rawId.trim().removePrefix("models/")
     if (id.isEmpty()) return false
     val lower = id.lowercase(Locale.ROOT)
 
-    val excludedKeywords = listOf(
-        "gemma",
-        "gemini-1.",
-        "gemini-2.0",
-        "gemini-exp",
-        "gemini-3.1-flash-lite-preview",
-        "llama-4-maverick",
-        "llama-4-scout",
-        "qwen3-32b",
-        "image",
-        "imagen",
-        "vision",
-        "-vl",
-        "llava",
-        "pixtral",
-        "flux",
-        "sdxl",
-        "stable-diffusion",
-        "dall-e",
-        "sora",
-        "veo",
-        "lyria",
-        "whisper",
-        "guard",
-        "prompt-guard",
-        "tts",
-        "playai",
-        "orpheus",
-        "embedding",
-        "moderation",
-        "babbage",
-        "davinci",
-        "curie",
-        "ada",
-        "realtime",
-        "transcribe",
-        "audio",
-        "live",
-        "search",
-        "computer-use",
-        "robotics",
-        "rerank",
-        "canary",
-        "aqa",
-        "learnlm",
-        "thinking-exp",
-        "customtools",
-        "gpt-3.5",
-        "deepseek-r1-distill",
-        "llama3-70b-8192",
-        "llama3-8b-8192",
-        "mixtral-8x7b",
-        "llama-3.2-",
-        "qwen-qwq",
-        "mistral-saba",
-        "allam",
-        "compound"
-    )
-    if (excludedKeywords.any { lower.contains(it) }) return false
+    if (EXCLUDED_MODEL_KEYWORDS.any { lower.contains(it) }) return false
 
     return when (provider) {
         AiProvider.GEMINI -> {
@@ -592,22 +593,26 @@ class OracleSettingsRepository private constructor(context: Context) {
             OracleSettings.DEFAULT_SYSTEM_PROMPT_RU
         }
 
+        val schemaVersion = prefs.getInt("prefs_schema_version", 1)
         val savedPrompt = prefs.getString("system_prompt", defaultPrompt) ?: defaultPrompt
-        val isLegacyOrStandardPrompt = savedPrompt == OracleSettings.DEFAULT_SYSTEM_PROMPT_RU ||
-            savedPrompt == OracleSettings.DEFAULT_SYSTEM_PROMPT_EN ||
+        val isStandardDefaultPrompt = savedPrompt == OracleSettings.DEFAULT_SYSTEM_PROMPT_RU ||
+            savedPrompt == OracleSettings.DEFAULT_SYSTEM_PROMPT_EN
+        val isLegacyBuiltInPrompt = schemaVersion < 2 && (
             savedPrompt.contains("{maxWords}", ignoreCase = true) ||
-            savedPrompt.contains("строго 1–2 слова", ignoreCase = true) ||
-            savedPrompt.contains("strictly 1–2 UPPERCASE words", ignoreCase = true) ||
-            savedPrompt.contains("светодиодной матрицы 25x25", ignoreCase = true) ||
-            savedPrompt.contains("25x25 LED Glyph Matrix", ignoreCase = true)
+                savedPrompt.contains("светодиодной матрицы 25x25", ignoreCase = true) ||
+                savedPrompt.contains("25x25 LED Glyph Matrix", ignoreCase = true)
+            )
 
-        val migratedPrompt = if (isLegacyOrStandardPrompt) {
+        val migratedPrompt = if (isStandardDefaultPrompt || isLegacyBuiltInPrompt) {
             if (savedPrompt != defaultPrompt) {
                 migrationEditor.putString("system_prompt", defaultPrompt)
             }
             defaultPrompt
         } else {
             savedPrompt
+        }
+        if (schemaVersion < 2) {
+            migrationEditor.putInt("prefs_schema_version", 2)
         }
 
         val groqKey = readAndMigrateApiKey("custom_groq_key", migrationEditor)

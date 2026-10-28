@@ -59,6 +59,26 @@ object AiOracleClient {
     private val jsonMediaType = "application/json".toMediaType()
     private val wavMediaType = "audio/wav".toMediaType()
 
+    private val Q_PREFIX_REGEX = Regex("^(?:Q|Question|Вопрос)\\s*:\\s*", RegexOption.IGNORE_CASE)
+    private val A_PREFIX_REGEX = Regex("^(?:A|Answer|Ответ)\\s*:\\s*", RegexOption.IGNORE_CASE)
+    private val CLOSED_THINK_REGEX = Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE)
+    private val UNCLOSED_THINK_REGEX = Regex("<think>[\\s\\S]*$", RegexOption.IGNORE_CASE)
+    private val ANSWER_PREFIX_REGEX = Regex("^(?:A|Answer|Ответ|Итог)\\s*:\\s*", RegexOption.IGNORE_CASE)
+    private val WHITESPACE_REGEX = Regex("\\s+")
+
+    private val STT_HALLUCINATIONS = listOf(
+        "субтитры сделал",
+        "субтитры создавал",
+        "редактор субтитров",
+        "продолжение следует",
+        "подпишись на канал",
+        "спасибо за просмотр",
+        "dimatorzok",
+        "amara.org",
+        "subtitles by",
+        "thank you for watching"
+    )
+
     private val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES))
@@ -340,14 +360,11 @@ object AiOracleClient {
             .filter { it.isNotBlank() }
         if (lines.isEmpty()) return null
 
-        val qPrefixRegex = Regex("^(?:Q|Question|Вопрос)\\s*:\\s*", RegexOption.IGNORE_CASE)
-        val aPrefixRegex = Regex("^(?:A|Answer|Ответ)\\s*:\\s*", RegexOption.IGNORE_CASE)
+        val qLineRaw = lines.firstOrNull { Q_PREFIX_REGEX.containsMatchIn(it) }
+        val aLineRaw = lines.firstOrNull { A_PREFIX_REGEX.containsMatchIn(it) }
 
-        val qLineRaw = lines.firstOrNull { qPrefixRegex.containsMatchIn(it) }
-        val aLineRaw = lines.firstOrNull { aPrefixRegex.containsMatchIn(it) }
-
-        val question = qLineRaw?.replaceFirst(qPrefixRegex, "")?.trim()
-        val explicitAnswer = aLineRaw?.replaceFirst(aPrefixRegex, "")?.trim()
+        val question = qLineRaw?.replaceFirst(Q_PREFIX_REGEX, "")?.trim()
+        val explicitAnswer = aLineRaw?.replaceFirst(A_PREFIX_REGEX, "")?.trim()
 
         if (!question.isNullOrBlank() && !explicitAnswer.isNullOrBlank()) {
             return question to explicitAnswer
@@ -356,7 +373,7 @@ object AiOracleClient {
         // If Q: was found but A: was not labeled, ONLY accept a subsequent line that is not Q:
         if (!question.isNullOrBlank() && lines.size >= 2) {
             val candidateAnswerLine = lines.last()
-            if (candidateAnswerLine != qLineRaw && !qPrefixRegex.containsMatchIn(candidateAnswerLine)) {
+            if (candidateAnswerLine != qLineRaw && !Q_PREFIX_REGEX.containsMatchIn(candidateAnswerLine)) {
                 return question to candidateAnswerLine
             }
         }
@@ -920,19 +937,7 @@ object AiOracleClient {
         val trimmed = raw.trim().trim('"', '\'', '«', '»')
         if (trimmed.isEmpty()) return ""
         val lower = trimmed.lowercase()
-        val hallucinations = listOf(
-            "субтитры сделал",
-            "субтитры создавал",
-            "редактор субтитров",
-            "продолжение следует",
-            "подпишись на канал",
-            "спасибо за просмотр",
-            "dimatorzok",
-            "amara.org",
-            "subtitles by",
-            "thank you for watching"
-        )
-        if (hallucinations.any { lower.contains(it) }) {
+        if (STT_HALLUCINATIONS.any { lower.contains(it) }) {
             return ""
         }
         return trimmed
@@ -1074,10 +1079,13 @@ object AiOracleClient {
     ): String {
         val trimmedModel = model.trim()
         val lowerModel = trimmedModel.lowercase()
-        val usesMaxCompletionTokens = lowerModel.startsWith("o1") ||
+        val isOpenAiOSeries = lowerModel.startsWith("o1") ||
             lowerModel.startsWith("o3") ||
             lowerModel.startsWith("o4") ||
-            lowerModel.startsWith("gpt-5")
+            lowerModel.contains("/o1") ||
+            lowerModel.contains("/o3") ||
+            lowerModel.contains("/o4")
+        val usesMaxCompletionTokens = isOpenAiOSeries || lowerModel.startsWith("gpt-5")
         val isReasoningModel = usesMaxCompletionTokens ||
             lowerModel.contains("r1") ||
             lowerModel.contains("reasoner") ||
@@ -1090,18 +1098,28 @@ object AiOracleClient {
             val payload = buildJsonObject {
                 put("model", trimmedModel)
                 putJsonArray("messages") {
-                    add(
-                        buildJsonObject {
-                            put("role", "system")
-                            put("content", systemInstruction)
-                        }
-                    )
-                    add(
-                        buildJsonObject {
-                            put("role", "user")
-                            put("content", question)
-                        }
-                    )
+                    if (minimalParams && isOpenAiOSeries) {
+                        add(
+                            buildJsonObject {
+                                put("role", "user")
+                                put("content", "$systemInstruction\n\n$question")
+                            }
+                        )
+                    } else {
+                        val instructionRole = if (isOpenAiOSeries && !isOpenRouter) "developer" else "system"
+                        add(
+                            buildJsonObject {
+                                put("role", instructionRole)
+                                put("content", systemInstruction)
+                            }
+                        )
+                        add(
+                            buildJsonObject {
+                                put("role", "user")
+                                put("content", question)
+                            }
+                        )
+                    }
                 }
                 if (!minimalParams) {
                     if (usesMaxCompletionTokens) {
@@ -1142,6 +1160,9 @@ object AiOracleClient {
                     lowerBody.contains("max_tokens") ||
                         lowerBody.contains("max_completion_tokens") ||
                         lowerBody.contains("temperature") ||
+                        lowerBody.contains("role") ||
+                        lowerBody.contains("developer") ||
+                        lowerBody.contains("system") ||
                         lowerBody.contains("unsupported")
                     )
                 if (isUnsupportedParamError) {
@@ -1427,30 +1448,23 @@ object AiOracleClient {
         maxWords: Int,
         isEnglish: Boolean = false
     ): String {
-        val withoutClosedThink = raw.replace(
-            Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE),
-            ""
-        )
-        val withoutThink = withoutClosedThink.replace(
-            Regex("<think>[\\s\\S]*$", RegexOption.IGNORE_CASE),
-            ""
-        ).trim()
+        val withoutClosedThink = raw.replace(CLOSED_THINK_REGEX, "")
+        val withoutThink = withoutClosedThink.replace(UNCLOSED_THINK_REGEX, "").trim()
 
         val nonEmptyLines = withoutThink
             .lines()
             .map { it.trim() }
             .filter { it.isNotBlank() && !it.startsWith("Thinking Process:", ignoreCase = true) }
 
-        val answerPrefixRegex = Regex("^(?:A|Answer|Ответ|Итог)\\s*:\\s*", RegexOption.IGNORE_CASE)
-        val labeledLine = nonEmptyLines.lastOrNull { answerPrefixRegex.containsMatchIn(it) }
-            ?.replaceFirst(answerPrefixRegex, "")
+        val labeledLine = nonEmptyLines.lastOrNull { ANSWER_PREFIX_REGEX.containsMatchIn(it) }
+            ?.replaceFirst(ANSWER_PREFIX_REGEX, "")
 
         val chosenLine = when {
             !labeledLine.isNullOrBlank() -> labeledLine
             nonEmptyLines.size > 1 -> {
                 val last = nonEmptyLines.last()
                 val first = nonEmptyLines.first()
-                if (last.split(Regex("\\s+")).size <= maxWords + 2) last else first
+                if (last.split(WHITESPACE_REGEX).size <= maxWords + 2) last else first
             }
             else -> nonEmptyLines.firstOrNull().orEmpty()
         }
@@ -1468,7 +1482,7 @@ object AiOracleClient {
 
         if (cleaned.isEmpty()) return "?"
 
-        val words = cleaned.split(Regex("\\s+")).filter { it.isNotBlank() }
+        val words = cleaned.split(WHITESPACE_REGEX).filter { it.isNotBlank() }
         val limited = words.take(maxWords.coerceIn(1, 5)).joinToString(" ")
         return limited.uppercase(if (isEnglish) java.util.Locale.US else java.util.Locale.getDefault())
     }

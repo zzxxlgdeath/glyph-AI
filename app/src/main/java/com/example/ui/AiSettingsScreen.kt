@@ -131,10 +131,46 @@ fun AiSettingsScreen(
     val resolvedKey = settings.getResolvedApiKey(activeProvider)
     val hasActiveKey = resolvedKey.isNotBlank()
     val rawModelInput = settings.getRawModelInput(activeProvider)
-    val customModelsForProvider = settings.getCustomModelsForProvider(activeProvider)
-    val fetchedModelsForProvider = settings.getFetchedModelsForProvider(activeProvider)
-    val allAvailableModels = settings.getAllModelsForProvider(activeProvider)
-    val hasAnySavedKey = AiProvider.entries.any { settings.getResolvedApiKey(it).isNotBlank() }
+    val customModelsForProvider = remember(
+        activeProvider,
+        settings.customGroqModels,
+        settings.customGeminiModels,
+        settings.customOpenRouterModels,
+        settings.customOpenAiModels,
+        settings.customDeepSeekModels,
+        settings.customCompatibleModels
+    ) {
+        settings.getCustomModelsForProvider(activeProvider)
+    }
+    val fetchedModelsForProvider = remember(
+        activeProvider,
+        settings.fetchedGroqModels,
+        settings.fetchedGeminiModels,
+        settings.fetchedOpenRouterModels,
+        settings.fetchedOpenAiModels,
+        settings.fetchedDeepSeekModels,
+        settings.fetchedCompatibleModels
+    ) {
+        settings.getFetchedModelsForProvider(activeProvider)
+    }
+    val allAvailableModels = remember(
+        activeProvider,
+        rawModelInput,
+        customModelsForProvider,
+        fetchedModelsForProvider
+    ) {
+        settings.getAllModelsForProvider(activeProvider)
+    }
+    val hasAnySavedKey = remember(
+        settings.customGroqKey,
+        settings.customGeminiKey,
+        settings.customOpenRouterKey,
+        settings.customOpenAiKey,
+        settings.customDeepSeekKey,
+        settings.customCompatibleKey
+    ) {
+        AiProvider.entries.any { settings.getResolvedApiKey(it).isNotBlank() }
+    }
 
     val filteredModels = remember(allAvailableModels, modelSearchQuery) {
         val q = modelSearchQuery.trim()

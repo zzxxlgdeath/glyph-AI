@@ -40,6 +40,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -111,6 +112,7 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
 
     private val isBindingHardware = AtomicBoolean(false)
     private val sessionToken = AtomicLong(0L)
+    private val wakeLockMutex = Any()
 
     // Conflated channel + reusable hardware buffer to avoid per-frame coroutine & Builder allocations
     private val hardwareFrameChannel = Channel<IntArray>(Channel.CONFLATED)
@@ -118,14 +120,26 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var lockScreenRecorder: LockScreenAudioRecorder? = null
+
+    @Volatile
     private var wakeLock: PowerManager.WakeLock? = null
 
+    @Volatile
     private var lastPartialTranscript: String = ""
+
+    @Volatile
     private var lastDisplayedAnswer: String? = null
 
+    @Volatile
     private var animationJob: Job? = null
+
+    @Volatile
     private var activeQueryJob: Job? = null
+
+    @Volatile
     private var speechWatchdogJob: Job? = null
+
+    @Volatile
     private var tickCounter = 0
 
     private val glyphCallback = object : GlyphMatrixManager.Callback {
@@ -343,9 +357,12 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
             isEnglish = isEn,
             onRmsChanged = { rmsDb ->
                 if (sessionToken.get() == token) {
-                    val current = _oracleState.value
-                    if (current is ToyOracleState.Listening && kotlin.math.abs(current.rmsDb - rmsDb) >= 0.7f) {
-                        _oracleState.value = current.copy(rmsDb = rmsDb)
+                    _oracleState.update { state ->
+                        if (state is ToyOracleState.Listening && kotlin.math.abs(state.rmsDb - rmsDb) >= 0.7f) {
+                            state.copy(rmsDb = rmsDb)
+                        } else {
+                            state
+                        }
                     }
                 }
             },
@@ -462,9 +479,12 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
 
                 override fun onRmsChanged(rmsdB: Float) {
                     if (sessionToken.get() != token) return
-                    val current = _oracleState.value
-                    if (current is ToyOracleState.Listening && kotlin.math.abs(current.rmsDb - rmsdB) >= 0.8f) {
-                        _oracleState.value = current.copy(rmsDb = rmsdB)
+                    _oracleState.update { state ->
+                        if (state is ToyOracleState.Listening && kotlin.math.abs(state.rmsDb - rmsdB) >= 0.8f) {
+                            state.copy(rmsDb = rmsdB)
+                        } else {
+                            state
+                        }
                     }
                 }
 
@@ -517,9 +537,12 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
                     if (partial.isNotBlank() && partial != lastPartialTranscript) {
                         lastPartialTranscript = partial
                         scheduleSpeechWatchdog(token, fallbackToAudioRecordOnError, isEn, 6_000L)
-                        val current = _oracleState.value
-                        if (current is ToyOracleState.Listening) {
-                            _oracleState.value = current.copy(partialText = partial)
+                        _oracleState.update { state ->
+                            if (state is ToyOracleState.Listening) {
+                                state.copy(partialText = partial)
+                            } else {
+                                state
+                            }
                         }
                     }
                 }
@@ -859,30 +882,34 @@ class GlyphOracleCoordinator private constructor(private val appContext: Context
     }
 
     private fun acquireWakeLock() {
-        try {
-            releaseWakeLock()
-            val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-            val wl = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "GlyphOracle::VoiceSessionWakeLock"
-            ).apply {
-                setReferenceCounted(false)
+        synchronized(wakeLockMutex) {
+            try {
+                releaseWakeLock()
+                val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+                val wl = pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "GlyphOracle::VoiceSessionWakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                }
+                wl.acquire(60_000L)
+                wakeLock = wl
+            } catch (_: Throwable) {
             }
-            wl.acquire(60_000L)
-            wakeLock = wl
-        } catch (_: Throwable) {
         }
     }
 
     private fun releaseWakeLock() {
-        try {
-            val wl = wakeLock
-            if (wl != null && wl.isHeld) {
-                wl.release()
+        synchronized(wakeLockMutex) {
+            try {
+                val wl = wakeLock
+                if (wl != null && wl.isHeld) {
+                    wl.release()
+                }
+            } catch (_: Throwable) {
+            } finally {
+                wakeLock = null
             }
-        } catch (_: Throwable) {
-        } finally {
-            wakeLock = null
         }
     }
 

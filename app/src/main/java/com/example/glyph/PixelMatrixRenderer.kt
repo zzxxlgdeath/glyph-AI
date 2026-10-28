@@ -17,6 +17,9 @@ object PixelMatrixRenderer {
 
     private val COMBINING_MARKS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
 
+    @Volatile
+    private var lastNormalizedCache: Pair<String, String>? = null
+
     // 5x7 pixel font map (each string has 7 rows of 5 characters: '#' = lit, '.' = off)
     private val FONT_5X7: Map<Char, List<String>> = mapOf(
         // Digits
@@ -129,8 +132,15 @@ object PixelMatrixRenderer {
      * - Converts to uppercase
      * - Preserves Russian 'Й' and 'Ё' while stripping Latin diacritics via NFD (e.g. É -> E, Ü -> U)
      * - Normalizes typographic dashes and apostrophes
+     * - Memoizes the most recent input/output pair so marquee loops don't re-run NFD/Regex per frame.
      */
     fun normalizeForMatrix(text: String): String {
+        if (text.isEmpty()) return ""
+        val cached = lastNormalizedCache
+        if (cached != null && (cached.first == text || cached.second === text || cached.second == text)) {
+            return cached.second
+        }
+
         val raw = text.trim().uppercase()
         if (raw.isEmpty()) return ""
 
@@ -146,7 +156,7 @@ object PixelMatrixRenderer {
         val nfd = Normalizer.normalize(protectedCyrillic, Normalizer.Form.NFD)
         val stripped = COMBINING_MARKS_REGEX.replace(nfd, "")
 
-        return stripped
+        val normalized = stripped
             .replace("\uE001", "Й")
             .replace("\uE002", "Ё")
             .replace('Ł', 'L')
@@ -154,6 +164,9 @@ object PixelMatrixRenderer {
             .replace("Æ", "AE")
             .replace("Œ", "OE")
             .replace("ß", "SS")
+
+        lastNormalizedCache = text to normalized
+        return normalized
     }
 
     /**
@@ -170,6 +183,10 @@ object PixelMatrixRenderer {
      */
     fun measureTextWidth(text: String): Int {
         val clean = normalizeForMatrix(text)
+        return measureNormalizedTextWidth(clean)
+    }
+
+    private fun measureNormalizedTextWidth(clean: String): Int {
         if (clean.isEmpty()) return 0
         var width = 0
         clean.forEachIndexed { index, ch ->
@@ -186,7 +203,7 @@ object PixelMatrixRenderer {
     fun shouldDisplayStatically(answer: String): Boolean {
         val clean = normalizeForMatrix(answer)
         if (clean.isEmpty()) return true
-        if (clean.length <= 4 && measureTextWidth(clean) <= 23) return true
+        if (clean.length <= 4 && measureNormalizedTextWidth(clean) <= 23) return true
         return false
     }
 
@@ -206,7 +223,7 @@ object PixelMatrixRenderer {
         setPixel(frame, 12, 1, clampedBrightness / 2)
         setPixel(frame, 12, 23, clampedBrightness / 2)
 
-        val totalWidth = measureTextWidth(clean)
+        val totalWidth = measureNormalizedTextWidth(clean)
         val startX = ((MATRIX_SIZE - totalWidth) / 2).coerceAtLeast(1)
         val startY = (MATRIX_SIZE - 7) / 2 // row 9..15
 
